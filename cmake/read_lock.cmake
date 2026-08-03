@@ -1,0 +1,5 @@
+file(READ "${LOCK}" content)
+foreach(field version url sha256)
+  string(JSON value GET "${content}" dependencies "${NAME}" "${field}")
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E echo "${field}=${value}")
+endforeach()

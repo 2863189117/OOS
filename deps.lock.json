@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "dependencies": {
+    "embree": {
+      "version": "4.3.3",
+      "url": "https://github.com/RenderKit/embree/archive/refs/tags/v4.3.3.tar.gz",
+      "sha256": "8a3bc3c3e21aa209d9861a28f8ba93b2f82ed0dc93341dddac09f1f03c36ef2d"
+    },
+    "hdf5": {
+      "version": "1.14.5",
+      "url": "https://github.com/HDFGroup/hdf5/archive/refs/tags/hdf5_1.14.5.tar.gz",
+      "sha256": "c83996dc79080a34e7b5244a1d5ea076abfd642ec12d7c25388e2fdd81d26350"
+    },
+    "yaml-cpp": {
+      "version": "0.8.0",
+      "url": "https://github.com/jbeder/yaml-cpp/archive/refs/tags/0.8.0.tar.gz",
+      "sha256": "fbe74bbdcee21d656715688706da3c8becfd946d92cd44705cc6098bb23b3a16"
+    },
+    "nlohmann_json": {
+      "version": "3.11.3",
+      "url": "https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz",
+      "sha256": "0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406"
+    },
+    "catch2": {
+      "version": "3.7.1",
+      "url": "https://github.com/catchorg/Catch2/archive/refs/tags/v3.7.1.tar.gz",
+      "sha256": "c991b247a1a0d7bb9c39aa35faf0fe9e19764213f28ffba3109388e62ee0269c"
+    }
+  }
+}

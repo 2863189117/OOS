@@ -1,0 +1,40 @@
+# Build and dependency trees
+/build*/
+/.deps/
+/install/
+
+# Simulation inputs, outputs, and research material
+/data/
+/output/
+/paper/
+/results/
+/runs/
+/tmp/
+*.h5
+*.hdf5
+*.csv
+*.tsv
+*.npy
+*.npz
+*.root
+*.dat
+*.log
+*.pdf
+*.png
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+
+# Compiled and local tooling artifacts
+*.so
+*.dylib
+*.dll
+*.a
+*.o
+__pycache__/
+*.py[cod]
+.DS_Store
+.nature-figure.json
+.idea/
+.vscode/

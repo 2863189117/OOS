@@ -1,0 +1,17 @@
+schema_version: 1
+sources:
+  - id: central-gas-track
+    domain: 0
+    spatial:
+      type: line_segment
+      start_mm: [0.0, 0.0, 10.0]
+      end_mm: [0.0, 0.0, 20.0]
+      count: 6
+      quadrature: gauss_legendre
+    angular:
+      type: isotropic_surface_shape_factor
+      relative_tolerance: 1.0e-5
+      maximum_subdivision_depth: 6
+      minimum_refinement_solid_angle_fraction: 1.0e-5
+      minimum_feature_solid_angle_fraction: 1.0e-8
+      feature_dihedral_degrees: 5.0

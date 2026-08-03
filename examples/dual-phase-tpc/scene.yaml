@@ -1,0 +1,100 @@
+schema_version: 1
+energy_eV: 7.0
+primary_domain: 0
+primary_domain_seed_mm: [0.0, 0.0, 30.0]
+geometry_hdf5: geometry.h5
+
+media:
+  - id: 0
+    name: GXe
+    refractive_index: 1.000702
+    absorption_length_mm: 3000.0
+  - id: 1
+    name: quartz
+    refractive_index: 1.6802071602248292
+    absorption_length_mm: 13.1
+  - id: 2
+    name: LXe
+    refractive_index: 1.6829
+    absorption_length_mm: 70000.0
+
+surfaces:
+  - id: 0
+    name: top_and_hole_ptfe
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.85
+  - id: 1
+    name: gxe_lxe
+    model: custom_nonlocal
+    two_sided: true
+    local_frame:
+      origin_mm: [0.0, 0.0, 0.0]
+      x_axis: [1.0, 0.0, 0.0]
+      y_axis: [0.0, 1.0, 0.0]
+      z_axis: [0.0, 0.0, 1.0]
+    plugin: liboos_lxe_plugin.so
+    plugin_config_json: >-
+      {"geometry":"finite_cylinder","radius_mm":1000.0,
+       "depth_mm":2000.0,"explicit_collision_order":7,
+       "nonlocal_domain_id":2,
+       "side_reflectivity":0.95,
+       "phase_grid":{"position_radial_bins":24,
+                     "position_phi_bins":72,
+                     "direction_mu_bins":4,
+                     "direction_phi_bins":16,
+                     "direction_mu_minimum":0.804},
+       "inward_normal":[0.0,0.0,-1.0],
+       "factorized_block_hdf5":"lxe-factorized-block.h5"}
+  - id: 2
+    name: quartz_window
+    model: dielectric_fresnel
+    two_sided: true
+  - id: 3
+    name: photocathode
+    model: sensitive
+    two_sided: true
+    detection_probability: 1.0
+    remainder: absorb
+  - id: 4
+    name: absorbing_boundary
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.0
+  - id: 5
+    name: field_cage_top_ptfe
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.85
+  - id: 6
+    name: outer_wall_ptfe
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.85
+  - id: 7
+    name: quartz_side_absorber
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.0
+  - id: 8
+    name: lxe_enclosure_absorber
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.0
+  - id: 9
+    name: al_flashing
+    model: specular_reflector
+    two_sided: true
+    reflectivity: 1.0
+
+numerics:
+  geometry_tolerance_mm: 1.0e-8
+  # The runtime also enforces an automatic Embree-float-safe lower bound.
+  ray_origin_offset_mm: 0.01
+  energy_tolerance: 1.0e-10
+  neumann_tolerance: 1.0e-10
+  # Modest deterministic boundary quadrature for the public example.
+  lambertian_mu2_order: 4
+  lambertian_phi_count: 24
+  maximum_specular_hits: 64
+  maximum_diffuse_bounces: 256

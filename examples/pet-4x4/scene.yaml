@@ -1,0 +1,60 @@
+schema_version: 1
+energy_eV: 6.98
+primary_domain: 0
+primary_domain_seed_mm: [0.0, 0.0, 0.0]
+geometry_hdf5: geometry.h5
+
+media:
+  - id: 0
+    name: LXe
+    refractive_index: 1.61
+    absorption_length_mm: 50000.0
+  - id: 1
+    name: quartz
+    refractive_index: 1.56
+    absorption_length_mm: 30000.0
+  - id: 2
+    name: silicon
+    refractive_index: 3.4
+    absorption_length_mm: 1.0
+
+surfaces:
+  - id: 0
+    name: ptfe_enclosure
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.99
+  - id: 1
+    name: lxe_quartz
+    model: dielectric_fresnel
+    two_sided: true
+  - id: 2
+    name: photocathode
+    model: sensitive
+    two_sided: true
+    detection_probability: 0.8
+    remainder: reflect_specular
+  - id: 3
+    name: lxe_silicon
+    model: dielectric_fresnel
+    two_sided: true
+  - id: 4
+    name: cathode_grid
+    model: lambertian
+    two_sided: true
+    reflectivity: 0.85
+  - id: 5
+    name: lower_anode_wires
+    model: specular_reflector
+    two_sided: true
+    reflectivity: 0.85
+
+numerics:
+  geometry_tolerance_mm: 1.0e-8
+  ray_origin_offset_mm: 0.0
+  energy_tolerance: 1.0e-10
+  neumann_tolerance: 1.0e-9
+  lambertian_mu2_order: 8
+  lambertian_phi_count: 32
+  maximum_specular_hits: 64
+  maximum_diffuse_bounces: 512
