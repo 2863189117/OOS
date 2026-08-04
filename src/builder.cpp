@@ -726,6 +726,22 @@ double exact_triangle_solid_angle(const Vec3& point,
   return 2.0 * std::atan2(numerator, denominator);
 }
 
+double estimated_triangle_solid_angle(
+    const Vec3& displacement, double distance,
+    const ShapeFactorTriangle& triangle) {
+  const Vec3 twice_area_normal =
+      cross(subtract(triangle.b, triangle.a),
+            subtract(triangle.c, triangle.a));
+  const double distance_squared = distance * distance;
+  return 0.5 * std::abs(dot(twice_area_normal, displacement)) /
+         (distance_squared * distance);
+}
+
+struct ShapeFactorTriangleSample {
+  Vec3 direction;
+  double solid_angle{};
+};
+
 std::array<ShapeFactorTriangle, 4> subdivide_shape_factor_triangle(
     const ShapeFactorTriangle& triangle) {
   const Vec3 ab = scale(add(triangle.a, triangle.b), 0.5);
@@ -816,10 +832,9 @@ struct ShapeFactorTraceContext {
   const ShapeFactorOptions& options;
 };
 
-RowAccumulation evaluate_shape_factor_triangle(
+ShapeFactorTriangleSample sample_shape_factor_triangle(
     const ShapeFactorTraceContext& context,
     const ShapeFactorTriangle& triangle) {
-  RowAccumulation result;
   const Vec3 center =
       scale(add(add(triangle.a, triangle.b), triangle.c), 1.0 / 3.0);
   const Vec3 displacement = subtract(center, context.source.position);
@@ -827,9 +842,27 @@ RowAccumulation evaluate_shape_factor_triangle(
   if (!(distance > 0.0))
     throw std::runtime_error(
         "shape-factor source coincides with a triangle centroid");
-  const Vec3 direction = scale(displacement, 1.0 / distance);
+  const double estimate =
+      estimated_triangle_solid_angle(displacement, distance, triangle);
+  const double threshold =
+      4.0 * pi *
+      context.options.maximum_approximate_solid_angle_fraction;
+  const bool require_exact =
+      !(threshold > 0.0) || !std::isfinite(estimate) ||
+      estimate > threshold;
+  return {scale(displacement, 1.0 / distance),
+          require_exact
+              ? exact_triangle_solid_angle(context.source.position, triangle)
+              : estimate};
+}
+
+RowAccumulation evaluate_shape_factor_triangle(
+    const ShapeFactorTraceContext& context,
+    const ShapeFactorTriangle& triangle,
+    const ShapeFactorTriangleSample& sample) {
+  RowAccumulation result;
   const Hit first = context.geometry.intersect(
-      {context.source.position, direction}, context.source.domain);
+      {context.source.position, sample.direction}, context.source.domain);
   // A non-convex boundary can contain triangles hidden behind the first
   // domain boundary.  They do not own any first-flight solid angle.  Mixed
   // visibility is resolved by the child comparison below.
@@ -850,17 +883,15 @@ RowAccumulation evaluate_shape_factor_triangle(
        first.plus_domain_id == context.source.domain);
   if (!exact_triangle && !analytic_replacement)
     return result;
-  const double solid_angle =
-      exact_triangle_solid_angle(context.source.position, triangle);
-  if (!(solid_angle > 0.0)) return result;
+  if (!(sample.solid_angle > 0.0)) return result;
   const double weight =
-      context.source.stokes.i * solid_angle / (4.0 * pi);
+      context.source.stokes.i * sample.solid_angle / (4.0 * pi);
   trace_branch(
       context.scene, context.geometry, context.primitive_to_state,
       context.channel_to_column, context.custom_runtimes,
-      {{context.source.position, direction},
+      {{context.source.position, sample.direction},
        {weight, 0.0, 0.0, 0.0},
-       shape_factor_reference_axis(direction), context.source.domain, 0,
+       shape_factor_reference_axis(sample.direction), context.source.domain, 0,
        first},
       result);
   return result;
@@ -1072,6 +1103,7 @@ RowAccumulation evaluate_shape_factor_analytic_element(
 
 struct ShapeFactorAssessment {
   std::array<ShapeFactorTriangle, 4> children;
+  std::array<ShapeFactorTriangleSample, 4> child_samples;
   std::array<RowAccumulation, 4> child_evaluations;
   RowAccumulation child_sum;
   double error{};
@@ -1080,16 +1112,14 @@ struct ShapeFactorAssessment {
 ShapeFactorAssessment assess_shape_factor_triangle(
     const ShapeFactorTraceContext& context,
     const ShapeFactorTriangle& triangle,
-    std::optional<RowAccumulation> parent_evaluation = std::nullopt) {
-  RowAccumulation parent =
-      parent_evaluation
-          ? std::move(*parent_evaluation)
-          : evaluate_shape_factor_triangle(context, triangle);
+    RowAccumulation parent) {
   ShapeFactorAssessment result;
   result.children = subdivide_shape_factor_triangle(triangle);
   for (std::size_t child = 0; child < result.children.size(); ++child) {
-    result.child_evaluations[child] =
-        evaluate_shape_factor_triangle(context, result.children[child]);
+    result.child_samples[child] =
+        sample_shape_factor_triangle(context, result.children[child]);
+    result.child_evaluations[child] = evaluate_shape_factor_triangle(
+        context, result.children[child], result.child_samples[child]);
     add_row(result.child_sum, result.child_evaluations[child]);
   }
   result.error = row_l1_difference(parent, result.child_sum);
@@ -1105,14 +1135,17 @@ ShapeFactorIntegral integrate_shape_factor_triangle(
     const ShapeFactorTraceContext& context,
     const ShapeFactorTriangle& triangle, double error_budget,
     double numerical_error_floor,
-    std::optional<RowAccumulation> parent_evaluation = std::nullopt) {
+    std::optional<RowAccumulation> parent_evaluation = std::nullopt,
+    std::optional<ShapeFactorTriangleSample> triangle_sample = std::nullopt) {
+  const ShapeFactorTriangleSample sample =
+      triangle_sample ? std::move(*triangle_sample)
+                      : sample_shape_factor_triangle(context, triangle);
   RowAccumulation parent =
       parent_evaluation
           ? std::move(*parent_evaluation)
-          : evaluate_shape_factor_triangle(context, triangle);
+          : evaluate_shape_factor_triangle(context, triangle, sample);
   const double solid_angle_fraction =
-      context.source.stokes.i *
-      exact_triangle_solid_angle(context.source.position, triangle) /
+      context.source.stokes.i * sample.solid_angle /
       (4.0 * pi);
   const bool touches_feature =
       std::any_of(triangle.feature_edges.begin(),
@@ -1148,7 +1181,8 @@ ShapeFactorIntegral integrate_shape_factor_triangle(
     auto refined = integrate_shape_factor_triangle(
         context, assessment.children[child], error_budget * fraction,
         numerical_error_floor,
-        std::move(assessment.child_evaluations[child]));
+        std::move(assessment.child_evaluations[child]),
+        assessment.child_samples[child]);
     add_row(result.row, refined.row);
     result.estimated_l1_error += refined.estimated_l1_error;
   }

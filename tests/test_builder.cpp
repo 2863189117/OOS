@@ -155,6 +155,7 @@ TEST_CASE("exact solid-angle source projection closes a mixed cavity") {
       {{0.1, 0.1, 0.1}, {1.0, 0.0, 0.0, 0.0}, 0});
   source.shape_factor.relative_tolerance = 1.0e-10;
   source.shape_factor.maximum_subdivision_depth = 4;
+  source.shape_factor.maximum_approximate_solid_angle_fraction = 0.0;
   const auto batch =
       oos::trace_source_quadratures(scene, operators, {source});
   REQUIRE(batch.count == 1);
@@ -171,6 +172,38 @@ TEST_CASE("exact solid-angle source projection closes a mixed cavity") {
   CHECK(accounted == Catch::Approx(1.0).margin(1.0e-10));
   CHECK(batch.direct_losses.back() ==
         Catch::Approx(0.0).margin(1.0e-10));
+
+  auto fallback = source;
+  fallback.shape_factor.maximum_subdivision_depth = 0;
+  fallback.shape_factor.maximum_approximate_solid_angle_fraction = 1.0e-3;
+  auto exact_at_same_depth = fallback;
+  exact_at_same_depth.shape_factor.maximum_approximate_solid_angle_fraction =
+      0.0;
+  const auto fallback_batch =
+      oos::trace_source_quadratures(scene, operators, {fallback});
+  const auto exact_at_same_depth_batch =
+      oos::trace_source_quadratures(scene, operators, {exact_at_same_depth});
+  CHECK(fallback_batch.initial_states ==
+        exact_at_same_depth_batch.initial_states);
+  CHECK(fallback_batch.direct_detection ==
+        exact_at_same_depth_batch.direct_detection);
+  CHECK(fallback_batch.direct_losses ==
+        exact_at_same_depth_batch.direct_losses);
+
+  auto approximate = source;
+  approximate.shape_factor.maximum_approximate_solid_angle_fraction = 1.0;
+  const auto approximate_batch =
+      oos::trace_source_quadratures(scene, operators, {approximate});
+  REQUIRE(approximate_batch.initial_states.size() ==
+          batch.initial_states.size());
+  REQUIRE(approximate_batch.direct_detection.size() ==
+          batch.direct_detection.size());
+  for (std::size_t index = 0; index < batch.initial_states.size(); ++index)
+    CHECK(approximate_batch.initial_states[index] ==
+          Catch::Approx(batch.initial_states[index]).margin(1.0e-4));
+  for (std::size_t index = 0; index < batch.direct_detection.size(); ++index)
+    CHECK(approximate_batch.direct_detection[index] ==
+          Catch::Approx(batch.direct_detection[index]).margin(1.0e-4));
 
   auto translated = source;
   translated.id = "shape-factor-translated";

@@ -83,11 +83,16 @@ Gauss-Legendre nodes in direction cosine and uniform midpoint nodes in
 azimuth, configured by `mu_order` and `phi_count`.
 
 `isotropic_surface_shape_factor` does not emit a fixed direction grid. The
-core integrates the exact solid angle of each boundary triangle, follows its
-centroid ray through the ordinary surface behavior, and recursively
-subdivides triangles until the parent/children response L1 difference meets
-`relative_tolerance`. It accepts `maximum_subdivision_depth`; zero performs
-the mandatory parent-to-four-children assessment without further recursion.
+core estimates each boundary triangle's solid angle with its centroid
+projected area. Estimates no larger than
+`maximum_approximate_solid_angle_fraction` of `4*pi` are used directly;
+larger estimates fall back to the exact triangle solid-angle formula. The
+default threshold is `1e-5`; setting it to zero restores exact-only weights.
+The core follows each centroid ray through the ordinary surface behavior and
+recursively subdivides triangles until the parent/children response L1
+difference meets `relative_tolerance`. It accepts
+`maximum_subdivision_depth`; zero performs the mandatory
+parent-to-four-children assessment without further recursion.
 The depth is a hard cap: a non-converged branch accepts its child sum and
 reports the residual parent/child L1 difference in
 `/response/source_integration_l1_error_estimate`. The accepted source row is
@@ -101,8 +106,8 @@ surface/domain junction or a crease sharper than
 `feature_dihedral_degrees` use
 `minimum_feature_solid_angle_fraction`; only children that still touch the
 original feature edge inherit that lower threshold. Thus distant smooth
-elements retain exact solid-angle weights without paying for unnecessary
-child rays. The global L1
+elements use inexpensive projected-area weights without paying for exact
+solid angles or unnecessary child rays. The global L1
 error budget is divided across top-level boundary triangles and redistributed
 within each child tree according to accepted child weight. This mode currently
 requires an unpolarized isotropic source in a declared closed domain.

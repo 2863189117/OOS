@@ -363,6 +363,9 @@ std::vector<SourceQuadrature> load_sources_yaml(
       if (angular["feature_dihedral_degrees"])
         quadrature.shape_factor.feature_dihedral_degrees =
             angular["feature_dihedral_degrees"].as<double>();
+      if (angular["maximum_approximate_solid_angle_fraction"])
+        quadrature.shape_factor.maximum_approximate_solid_angle_fraction =
+            angular["maximum_approximate_solid_angle_fraction"].as<double>();
       if (angular["aperture_edge_phi_order"])
         quadrature.shape_factor.aperture_edge_phi_order =
             angular["aperture_edge_phi_order"].as<std::uint32_t>();
@@ -390,6 +393,14 @@ std::vector<SourceQuadrature> load_sources_yaml(
               quadrature.shape_factor.feature_dihedral_degrees))
         throw std::runtime_error(
             "shape-factor feature_dihedral_degrees must be in [0,180)");
+      if (!(quadrature.shape_factor
+                .maximum_approximate_solid_angle_fraction >= 0.0) ||
+          !std::isfinite(
+              quadrature.shape_factor
+                  .maximum_approximate_solid_angle_fraction))
+        throw std::runtime_error(
+            "shape-factor maximum_approximate_solid_angle_fraction must "
+            "be finite and nonnegative");
       if (quadrature.shape_factor.aperture_edge_phi_order == 0)
         throw std::runtime_error(
             "shape-factor aperture_edge_phi_order must be positive");

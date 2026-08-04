@@ -206,6 +206,7 @@ sources:
       minimum_refinement_solid_angle_fraction: 3.0e-5
       minimum_feature_solid_angle_fraction: 4.0e-8
       feature_dihedral_degrees: 7.5
+      maximum_approximate_solid_angle_fraction: 8.0e-6
       aperture_edge_phi_order: 12
       aperture_edge_weight_threshold: 6.0e-8
 )";
@@ -234,6 +235,9 @@ sources:
         Catch::Approx(4.0e-8));
   CHECK(sources[0].shape_factor.feature_dihedral_degrees ==
         Catch::Approx(7.5));
+  CHECK(sources[0]
+            .shape_factor.maximum_approximate_solid_angle_fraction ==
+        Catch::Approx(8.0e-6));
   CHECK(sources[0].shape_factor.aperture_edge_phi_order == 12);
   CHECK(sources[0].shape_factor.aperture_edge_weight_threshold ==
         Catch::Approx(6.0e-8));
