@@ -45,5 +45,7 @@ cycles, and 2 mm grid spacing. Those settings are computationally expensive
 and are not implied to be a detector-performance result.
 
 The workflow generates geometry, validates the scene, builds operators,
-calculates direct and bounded responses, and materializes a parallel-line
-response grid. Generated HDF5 files are outputs and must not be committed.
+calculates direct and adjoint-precomputed bounded responses, and materializes
+a parallel-line response grid. Python orchestrates the installed C++ tools;
+it contains no independent response-precompute implementation. Generated
+HDF5 files are outputs and must not be committed.

@@ -65,6 +65,12 @@ oos-regress grid operators.h5 --precomputed effective.h5 \
 oos-regress fit --hits hits.h5 --grid grid.h5 --output regression.h5
 ```
 
+`precompute` constructs the bounded response exclusively through terminal-
+basis adjoint propagation. Function plugins must export
+`oos_get_function_operator_v2` with paired linear forward and adjoint actions.
+V1 function plugins and `oos.effective-bounded-response.v1` files are not
+accepted.
+
 See `docs/formats.md`, `docs/architecture.md`,
 `examples/dual-phase-tpc/README.md`, and `examples/pet-4x4/README.md`.
 

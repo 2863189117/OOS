@@ -137,6 +137,7 @@ TEST_CASE("CUDA executes a factorized nonlocal LXe function block") {
   operators.energy_eV = 7.0;
   operators.tolerance = 1e-13;
   operators.maximum_iterations = 64;
+  operators.cache_key_sha256 = "cuda-factorized-function-test";
 
   oos::FunctionBlock block;
   block.name = "lxe";
@@ -175,6 +176,39 @@ TEST_CASE("CUDA executes a factorized nonlocal LXe function block") {
             Catch::Approx(cpu.losses[index]).margin(1e-12));
   REQUIRE(cuda.float32_efficiency_loss_upper_bound ==
           cpu.float32_efficiency_loss_upper_bound);
+
+  const auto cpu_effective =
+      oos::build_effective_response_cpu(operators, 5, 1);
+  const auto cuda_effective =
+      oos::build_effective_response_cuda(operators, 5, 2);
+  for (std::size_t index = 0;
+       index < cpu_effective.state_to_detection.size(); ++index)
+    REQUIRE(cuda_effective.state_to_detection[index] ==
+            Catch::Approx(cpu_effective.state_to_detection[index])
+                .margin(1e-12));
+  for (std::size_t index = 0;
+       index < cpu_effective.state_to_losses.size(); ++index)
+    REQUIRE(cuda_effective.state_to_losses[index] ==
+            Catch::Approx(cpu_effective.state_to_losses[index])
+                .margin(1e-12));
+  for (std::size_t index = 0;
+       index < cpu_effective.state_unresolved.size(); ++index)
+    REQUIRE(cuda_effective.state_unresolved[index] ==
+            Catch::Approx(cpu_effective.state_unresolved[index])
+                .margin(1e-12));
+  const auto precomputed =
+      oos::apply_effective_response_cuda(cuda_effective, sources);
+  const auto fixed = oos::Solver::solve_cpu(
+      operators, sources, oos::SolveControl{5, false});
+  for (std::size_t index = 0; index < fixed.efficiency.size(); ++index)
+    REQUIRE(precomputed.efficiency[index] ==
+            Catch::Approx(fixed.efficiency[index]).margin(1e-12));
+  for (std::size_t index = 0; index < fixed.losses.size(); ++index)
+    REQUIRE(precomputed.losses[index] ==
+            Catch::Approx(fixed.losses[index]).margin(1e-12));
+  for (std::size_t index = 0; index < fixed.unresolved.size(); ++index)
+    REQUIRE(precomputed.unresolved[index] ==
+            Catch::Approx(fixed.unresolved[index]).margin(1e-12));
   std::filesystem::remove(path);
 }
 #endif

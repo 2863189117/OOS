@@ -808,9 +808,15 @@ void save_effective_response_hdf5(const std::filesystem::path& path,
                 {response.channels});
   create_group(file, "/metadata");
   write_string(file, "/metadata/schema",
-               "oos.effective-bounded-response.v1");
+               "oos.effective-adjoint-response.v2");
+  write_string(file, "/metadata/construction_method",
+               response.construction_method);
   write_dataset(file, "/metadata/cycles",
                 std::vector<std::uint32_t>{response.cycles}, {1});
+  write_dataset(file, "/metadata/build_batch_size",
+                std::vector<std::uint64_t>{response.build_batch_size}, {1});
+  write_dataset(file, "/metadata/operator_tolerance",
+                std::vector<double>{response.operator_tolerance}, {1});
   write_string(file, "/metadata/operator_cache_key_sha256",
                response.operator_cache_key_sha256);
   write_string(file, "/metadata/code_commit", response.code_commit);
@@ -822,7 +828,7 @@ EffectiveResponse load_effective_response_hdf5(
     const std::filesystem::path& path) {
   H5Handle file(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
   if (read_string(file, "/metadata/schema") !=
-      "oos.effective-bounded-response.v1")
+      "oos.effective-adjoint-response.v2")
     throw std::runtime_error("unsupported effective response schema");
   EffectiveResponse response;
   auto [detection, detection_dims] =
@@ -846,6 +852,13 @@ EffectiveResponse load_effective_response_hdf5(
       read_dataset<std::int32_t>(file, "/effective/channel_id").first;
   response.cycles =
       read_dataset<std::uint32_t>(file, "/metadata/cycles").first.at(0);
+  response.build_batch_size =
+      read_dataset<std::uint64_t>(file, "/metadata/build_batch_size")
+          .first.at(0);
+  response.operator_tolerance =
+      read_dataset<double>(file, "/metadata/operator_tolerance").first.at(0);
+  response.construction_method =
+      read_string(file, "/metadata/construction_method");
   response.operator_cache_key_sha256 =
       read_string(file, "/metadata/operator_cache_key_sha256");
   response.code_commit = read_string(file, "/metadata/code_commit");

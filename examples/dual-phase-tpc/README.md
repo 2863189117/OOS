@@ -25,6 +25,8 @@ layout. `generator/build_analytic_geometry.py` adds an adaptive analytic
 transport basis. `generator/build_lxe_function_block.py` produces the
 geometry-independent liquid response used by `liboos_lxe_plugin.so`.
 Generated HDF5 files are runtime outputs and must not be committed.
+The system response is materialized by the C++ adjoint precompute; the Python
+generators only build geometry and the intrinsic LXe factorized block.
 
 Build the optional plugin from the OOS repository root:
 

@@ -312,7 +312,7 @@ def main() -> None:
     effective = (
         arguments.cache_dir
         / (
-            f"effective-seven-cycle-{arguments.geometry_mode}-"
+            f"effective-adjoint-seven-cycle-{arguments.geometry_mode}-"
             f"{arguments.geometry_profile}.h5"
         )
     )

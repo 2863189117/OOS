@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define OOS_SURFACE_PLUGIN_ABI_V3 3u
-#define OOS_FUNCTION_OPERATOR_ABI_V1 1u
+#define OOS_FUNCTION_OPERATOR_ABI_V2 2u
 
 typedef enum oos_surface_locality_v3 {
   OOS_SURFACE_LOCAL_V3 = 1,
@@ -89,11 +89,14 @@ typedef const oos_surface_plugin_v3* (*oos_get_surface_plugin_v3_fn)(void);
  * intrinsic state, surface-relative egress coefficients, and intrinsic
  * losses.  The core maps egress coefficients through the external geometry.
  *
- * All arrays are contiguous row-major float64.  Implementations must be
- * deterministic, linear, non-negative, and passive.  The core validates
- * those properties with probe batches before accepting an operator cache.
+ * All arrays are contiguous row-major float64. Implementations must expose
+ * the intended deterministic linear physical action and its Euclidean
+ * adjoint. Numerical clipping or input-dependent renormalization is not part
+ * of this ABI. A truncated spectral representation may therefore contain
+ * signed intermediate coefficients while remaining a linear representation
+ * of a passive physical map.
  */
-typedef struct oos_function_operator_descriptor_v1 {
+typedef struct oos_function_operator_descriptor_v2 {
   uint32_t abi_version;
   uint64_t input_state_count;
   uint64_t retained_state_count;
@@ -102,17 +105,9 @@ typedef struct oos_function_operator_descriptor_v1 {
   double contraction_bound;
   uint32_t supports_cpu;
   uint32_t supports_cuda;
-} oos_function_operator_descriptor_v1;
+} oos_function_operator_descriptor_v2;
 
-typedef struct oos_function_operator_audit_v1 {
-  double input_weight;
-  double retained_weight;
-  double egress_weight;
-  double loss_weight;
-  double closure_error;
-} oos_function_operator_audit_v1;
-
-typedef struct oos_function_operator_v1 {
+typedef struct oos_function_operator_v2 {
   uint32_t abi_version;
   oos_string_view_v1 name;
   oos_string_view_v1 version;
@@ -120,23 +115,30 @@ typedef struct oos_function_operator_v1 {
                                        double energy_eV);
   int32_t (*create)(oos_string_view_v1 config_json, double energy_eV,
                     void** instance,
-                    oos_function_operator_descriptor_v1* descriptor);
+                    oos_function_operator_descriptor_v2* descriptor);
   void (*destroy)(void* instance);
   int32_t (*apply_cpu)(void* instance, uint64_t batch,
                        const double* input, double* retained,
-                       double* egress, double* losses,
-                       oos_function_operator_audit_v1* audit);
+                       double* egress, double* losses);
+  int32_t (*apply_adjoint_cpu)(
+      void* instance, uint64_t batch, const double* retained_adjoint,
+      const double* egress_adjoint, const double* losses_adjoint,
+      double* input_adjoint);
   int32_t (*prepare_cuda)(void* instance, int32_t device);
   int32_t (*apply_cuda)(void* instance, uint64_t batch,
                         const double* device_input,
                         double* device_retained, double* device_egress,
-                        double* device_losses, void* cuda_stream,
-                        /* May be null for asynchronous production solves. */
-                        oos_function_operator_audit_v1* host_audit);
-} oos_function_operator_v1;
+                        double* device_losses, void* cuda_stream);
+  int32_t (*apply_adjoint_cuda)(
+      void* instance, uint64_t batch,
+      const double* device_retained_adjoint,
+      const double* device_egress_adjoint,
+      const double* device_losses_adjoint,
+      double* device_input_adjoint, void* cuda_stream);
+} oos_function_operator_v2;
 
-typedef const oos_function_operator_v1*
-    (*oos_get_function_operator_v1_fn)(void);
+typedef const oos_function_operator_v2*
+    (*oos_get_function_operator_v2_fn)(void);
 
 #ifdef __cplusplus
 }

@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
       std::filesystem::rename(temporary, output);
       std::cout << "precomputed " << response.states << " states x "
                 << response.channels << " channels for " << response.cycles
-                << " cycles\n";
+                << " cycles using the adjoint solver\n";
       return 0;
     }
     if (command == "calculate") {

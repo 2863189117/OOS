@@ -21,7 +21,6 @@ struct CudaState {
   double* surface_weight{};
   double* input_total{};
   double* expected_total{};
-  double* positive_total{};
 };
 
 bool okay(cudaError_t status) { return status == cudaSuccess; }
@@ -32,13 +31,11 @@ void release_scratch(CudaState& state) {
   cudaFree(state.surface_weight);
   cudaFree(state.input_total);
   cudaFree(state.expected_total);
-  cudaFree(state.positive_total);
   state.phase_modes = nullptr;
   state.modal_surface = nullptr;
   state.surface_weight = nullptr;
   state.input_total = nullptr;
   state.expected_total = nullptr;
-  state.positive_total = nullptr;
   state.capacity = 0;
 }
 
@@ -59,8 +56,7 @@ bool ensure_capacity(const LXeFunctionInstance& function, CudaState& state,
       !okay(cudaMalloc(&state.surface_weight,
                        surface_count * sizeof(double))) ||
       !okay(cudaMalloc(&state.input_total, batch * sizeof(double))) ||
-      !okay(cudaMalloc(&state.expected_total, batch * sizeof(double))) ||
-      !okay(cudaMalloc(&state.positive_total, batch * sizeof(double)))) {
+      !okay(cudaMalloc(&state.expected_total, batch * sizeof(double)))) {
     release_scratch(state);
     return false;
   }
@@ -209,53 +205,24 @@ __global__ void surface_weights_kernel(
         make_cuDoubleComplex(cos(order * phi), sin(order * phi));
     density = cuCadd(density, cuCmul(mode, basis));
   }
-  const double raw =
+  surface_weight[linear] =
       cuCreal(density) * ring_area[surface] /
       static_cast<double>(surface_phi);
-  const double positive = fmax(0.0, raw);
-  surface_weight[linear] = positive;
 }
 
-__global__ void positive_totals_kernel(
-    const double* surface_weight, std::uint64_t batch,
-    std::uint64_t surface_count, double* positive_total) {
-  const auto row = static_cast<std::uint64_t>(blockIdx.x);
-  if (row >= batch) return;
-  double local = 0.0;
-  for (std::uint64_t surface = threadIdx.x; surface < surface_count;
-       surface += blockDim.x)
-    local += surface_weight[row * surface_count + surface];
-  __shared__ double partial[256];
-  partial[threadIdx.x] = local;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x / 2; stride != 0; stride /= 2) {
-    if (threadIdx.x < stride)
-      partial[threadIdx.x] += partial[threadIdx.x + stride];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) positive_total[row] = partial[0];
-}
-
-__global__ void normalize_egress_kernel(
-    const double* surface_weight, const double* expected_total,
-    const double* positive_total, const double* angular_weight,
+__global__ void egress_kernel(
+    const double* surface_weight, const double* angular_weight,
     std::uint64_t batch, std::uint64_t surface_count,
     std::uint64_t angular, double* egress) {
   const auto linear =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const auto count = batch * surface_count * angular;
   if (linear >= count) return;
-  auto value = linear;
-  const auto angle = value % angular;
-  value /= angular;
-  const auto surface = value % surface_count;
-  const auto row = value / surface_count;
-  const double normalization =
-      positive_total[row] > 0.0
-          ? expected_total[row] / positive_total[row]
-          : 0.0;
-  egress[linear] = surface_weight[row * surface_count + surface] *
-                   normalization * angular_weight[angle];
+  const auto angle = linear % angular;
+  const auto surface = (linear / angular) % surface_count;
+  const auto row = linear / (surface_count * angular);
+  egress[linear] =
+      surface_weight[row * surface_count + surface] * angular_weight[angle];
 }
 
 __global__ void losses_kernel(const double* input_total,
@@ -264,7 +231,131 @@ __global__ void losses_kernel(const double* input_total,
   const auto row =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row < batch)
-    losses[row] = fmax(0.0, input_total[row] - expected_total[row]);
+    losses[row] = input_total[row] - expected_total[row];
+}
+
+__global__ void egress_adjoint_surface_kernel(
+    const double* egress_adjoint, const double* angular_weight,
+    const double* ring_area, std::uint64_t batch,
+    std::uint64_t surface_radial, std::uint64_t surface_phi,
+    std::uint64_t angular, double* surface_adjoint) {
+  const auto linear =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto surface_count = surface_radial * surface_phi;
+  const auto count = batch * surface_count;
+  if (linear >= count) return;
+  const auto surface_index = linear % surface_count;
+  const auto surface = surface_index / surface_phi;
+  const auto row = linear / surface_count;
+  double value = 0.0;
+  for (std::uint64_t angle = 0; angle < angular; ++angle)
+    value += egress_adjoint[
+                 (row * surface_count + surface_index) * angular + angle] *
+             angular_weight[angle];
+  surface_adjoint[linear] =
+      value * ring_area[surface] / static_cast<double>(surface_phi);
+}
+
+__global__ void surface_modes_adjoint_kernel(
+    const double* surface_adjoint, std::uint64_t batch,
+    std::uint64_t orders, std::uint64_t surface_radial,
+    std::uint64_t surface_phi, cuDoubleComplex* output) {
+  const auto linear =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto count = batch * orders * surface_radial;
+  if (linear >= count) return;
+  auto value = linear;
+  const auto surface = value % surface_radial;
+  value /= surface_radial;
+  const auto order = value % orders;
+  const auto row = value / orders;
+  constexpr double two_pi =
+      6.283185307179586476925286766559005768;
+  double real = 0.0;
+  double imaginary = 0.0;
+  for (std::uint64_t phi_index = 0; phi_index < surface_phi; ++phi_index) {
+    const double seed = surface_adjoint[
+        (row * surface_radial + surface) * surface_phi + phi_index];
+    const double phi =
+        two_pi * (static_cast<double>(phi_index) + 0.5) /
+        static_cast<double>(surface_phi);
+    real += seed * cos(order * phi);
+    imaginary += seed * sin(order * phi);
+  }
+  output[linear] = make_cuDoubleComplex(real, imaginary);
+}
+
+__global__ void phase_modes_adjoint_kernel(
+    const cuDoubleComplex* surface_modes,
+    const cuDoubleComplex* coefficients, std::uint64_t batch,
+    std::uint64_t nr, std::uint64_t nm, std::uint64_t nd,
+    std::uint64_t orders, std::uint64_t surface_radial,
+    cuDoubleComplex* output) {
+  const auto linear =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto count = batch * nr * nm * nd * orders;
+  if (linear >= count) return;
+  auto value = linear;
+  const auto order = value % orders;
+  value /= orders;
+  const auto direction_phi = value % nd;
+  value /= nd;
+  const auto mu = value % nm;
+  value /= nm;
+  const auto radial = value % nr;
+  const auto row = value / nr;
+  cuDoubleComplex result = make_cuDoubleComplex(0.0, 0.0);
+  for (std::uint64_t surface = 0; surface < surface_radial; ++surface) {
+    const auto coefficient_index =
+        ((((direction_phi * nr + radial) * nm + mu) * orders + order) *
+             surface_radial +
+         surface);
+    result = cuCadd(
+        result,
+        cuCmul(coefficients[coefficient_index],
+               surface_modes[(row * orders + order) * surface_radial +
+                             surface]));
+  }
+  output[linear] = result;
+}
+
+__global__ void input_adjoint_kernel(
+    const cuDoubleComplex* phase_adjoint, const double* expected_return,
+    const double* losses_adjoint, std::uint64_t batch,
+    std::uint64_t nr, std::uint64_t np, std::uint64_t nm,
+    std::uint64_t nd, std::uint64_t orders, double* input_adjoint) {
+  const auto linear =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto states = nr * np * nm * nd;
+  const auto count = batch * states;
+  if (linear >= count) return;
+  auto state = linear % states;
+  const auto row = linear / states;
+  const auto direction_phi = state % nd;
+  state /= nd;
+  const auto mu = state % nm;
+  state /= nm;
+  const auto position_phi = state % np;
+  const auto radial = state / np;
+  const auto expected_index =
+      (direction_phi * nr + radial) * nm + mu;
+  double result = losses_adjoint[row] *
+                  (1.0 - expected_return[expected_index]);
+  constexpr double two_pi =
+      6.283185307179586476925286766559005768;
+  const double phi = two_pi * static_cast<double>(position_phi) /
+                     static_cast<double>(np);
+  for (std::uint64_t order = 0; order < orders; ++order) {
+    const auto mode =
+        phase_adjoint[
+            ((((row * nr + radial) * nm + mu) * nd + direction_phi) *
+                 orders +
+             order)];
+    result += cuCreal(cuCmul(
+        mode,
+        make_cuDoubleComplex(cos(order * phi), -sin(order * phi))));
+  }
+  input_adjoint[linear] = result;
 }
 
 }  // namespace
@@ -318,8 +409,7 @@ int prepare_lxe_function_cuda(LXeFunctionInstance* function,
 int apply_lxe_function_cuda(
     LXeFunctionInstance* function, std::uint64_t batch,
     const double* device_input, double* device_retained,
-    double* device_egress, double* device_losses, void* stream_pointer,
-    oos_function_operator_audit_v1* host_audit) {
+    double* device_egress, double* device_losses, void* stream_pointer) {
   if (!function || !function->cuda_state || !device_input ||
       !device_retained || !device_egress || !device_losses)
     return 1;
@@ -367,41 +457,71 @@ int apply_lxe_function_cuda(
       state.modal_surface, state.surface_ring_area, batch, function->orders,
       function->surface_radial, function->surface_phi,
       state.surface_weight);
-  positive_totals_kernel<<<static_cast<unsigned int>(batch), threads, 0,
-                            stream>>>(
-      state.surface_weight, batch, surface_count, state.positive_total);
-  normalize_egress_kernel<<<
+  egress_kernel<<<
       static_cast<unsigned int>(
           (batch * egress_count + threads - 1) / threads),
       threads, 0, stream>>>(
-      state.surface_weight, state.expected_total, state.positive_total,
-      state.angular_weight, batch, surface_count, function->angular,
+      state.surface_weight, state.angular_weight, batch, surface_count,
+      function->angular,
       device_egress);
   losses_kernel<<<static_cast<unsigned int>((batch + threads - 1) / threads),
                   threads, 0, stream>>>(
       state.input_total, state.expected_total, batch, device_losses);
-  if (!okay(cudaGetLastError())) return 4;
-  if (host_audit) {
-    std::vector<double> input_total(batch);
-    std::vector<double> expected_total(batch);
-    std::vector<double> losses(batch);
-    if (!okay(cudaMemcpyAsync(input_total.data(), state.input_total,
-                              batch * sizeof(double),
-                              cudaMemcpyDeviceToHost, stream)) ||
-        !okay(cudaMemcpyAsync(expected_total.data(), state.expected_total,
-                              batch * sizeof(double),
-                              cudaMemcpyDeviceToHost, stream)) ||
-        !okay(cudaMemcpyAsync(losses.data(), device_losses,
-                              batch * sizeof(double),
-                              cudaMemcpyDeviceToHost, stream)) ||
-        !okay(cudaStreamSynchronize(stream)))
-      return 5;
-    for (std::uint64_t row = 0; row < batch; ++row)
-      host_audit[row] = {
-          input_total[row], 0.0, expected_total[row], losses[row],
-          expected_total[row] + losses[row] - input_total[row]};
-  }
-  return 0;
+  return okay(cudaGetLastError()) ? 0 : 4;
+}
+
+int apply_lxe_function_adjoint_cuda(
+    LXeFunctionInstance* function, std::uint64_t batch,
+    const double* device_retained_adjoint,
+    const double* device_egress_adjoint,
+    const double* device_losses_adjoint, double* device_input_adjoint,
+    void* stream_pointer) {
+  if (!function || !function->cuda_state || !device_retained_adjoint ||
+      !device_egress_adjoint || !device_losses_adjoint ||
+      !device_input_adjoint)
+    return 1;
+  auto& state = *static_cast<CudaState*>(function->cuda_state);
+  if (!okay(cudaSetDevice(state.device)) ||
+      !ensure_capacity(*function, state, batch))
+    return 2;
+  (void)device_retained_adjoint;
+  const auto stream = reinterpret_cast<cudaStream_t>(stream_pointer);
+  const auto states =
+      function->nr * function->np * function->nm * function->nd;
+  const auto phase_mode_count =
+      batch * function->nr * function->nm * function->nd *
+      function->orders;
+  const auto modal_count =
+      batch * function->orders * function->surface_radial;
+  const auto surface_count =
+      function->surface_radial * function->surface_phi;
+  constexpr int threads = 256;
+  egress_adjoint_surface_kernel<<<
+      static_cast<unsigned int>(
+          (batch * surface_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      device_egress_adjoint, state.angular_weight,
+      state.surface_ring_area, batch, function->surface_radial,
+      function->surface_phi, function->angular, state.surface_weight);
+  surface_modes_adjoint_kernel<<<
+      static_cast<unsigned int>((modal_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.surface_weight, batch, function->orders,
+      function->surface_radial, function->surface_phi,
+      state.modal_surface);
+  phase_modes_adjoint_kernel<<<
+      static_cast<unsigned int>((phase_mode_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.modal_surface, state.coefficients, batch, function->nr,
+      function->nm, function->nd, function->orders,
+      function->surface_radial, state.phase_modes);
+  input_adjoint_kernel<<<
+      static_cast<unsigned int>((batch * states + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.phase_modes, state.expected_return, device_losses_adjoint, batch,
+      function->nr, function->np, function->nm, function->nd,
+      function->orders, device_input_adjoint);
+  return okay(cudaGetLastError()) ? 0 : 4;
 }
 
 void destroy_lxe_function_cuda(LXeFunctionInstance* function) {

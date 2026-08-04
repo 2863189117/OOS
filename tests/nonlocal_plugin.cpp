@@ -108,10 +108,10 @@ const oos_surface_plugin_v3 plugin{
 };
 
 int32_t create_function(oos_string_view_v1, double, void** instance,
-                        oos_function_operator_descriptor_v1* descriptor) {
+                        oos_function_operator_descriptor_v2* descriptor) {
   static int token = 1;
   *instance = &token;
-  *descriptor = {OOS_FUNCTION_OPERATOR_ABI_V1, 1, 1, 1, 1,
+  *descriptor = {OOS_FUNCTION_OPERATOR_ABI_V2, 1, 1, 1, 1,
                  0.1, 1, 0};
   return 0;
 }
@@ -119,25 +119,35 @@ int32_t create_function(oos_string_view_v1, double, void** instance,
 void destroy_function(void*) {}
 
 int32_t apply_function(void*, std::uint64_t batch, const double* input,
-                       double* retained, double* egress, double* losses,
-                       oos_function_operator_audit_v1* audit) {
+                       double* retained, double* egress, double* losses) {
   for (std::uint64_t row = 0; row < batch; ++row) {
     retained[row] = 0.1 * input[row];
     egress[row] = 0.4 * input[row];
     losses[row] = 0.5 * input[row];
-    audit[row] = {input[row], retained[row], egress[row], losses[row], 0.0};
   }
   return 0;
 }
 
-const oos_function_operator_v1 function_operator{
-    OOS_FUNCTION_OPERATOR_ABI_V1,
+int32_t apply_function_adjoint(void*, std::uint64_t batch,
+                               const double* retained,
+                               const double* egress, const double* losses,
+                               double* input) {
+  for (std::uint64_t row = 0; row < batch; ++row)
+    input[row] =
+        0.1 * retained[row] + 0.4 * egress[row] + 0.5 * losses[row];
+  return 0;
+}
+
+const oos_function_operator_v2 function_operator{
+    OOS_FUNCTION_OPERATOR_ABI_V2,
     {"oos_test_nonlocal_function", 26},
     {"1.0.0", 5},
     validate,
     create_function,
     destroy_function,
     apply_function,
+    apply_function_adjoint,
+    nullptr,
     nullptr,
     nullptr,
 };
@@ -148,7 +158,7 @@ oos_get_surface_plugin_v3(void) {
   return &plugin;
 }
 
-extern "C" OOS_PLUGIN_EXPORT const oos_function_operator_v1*
-oos_get_function_operator_v1(void) {
+extern "C" OOS_PLUGIN_EXPORT const oos_function_operator_v2*
+oos_get_function_operator_v2(void) {
   return &function_operator;
 }

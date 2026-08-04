@@ -20,6 +20,10 @@ TEST_CASE("function operator validates and applies batches") {
   for (std::size_t index = 0; index < expected_losses.size(); ++index)
     REQUIRE(result.losses[index] ==
             Catch::Approx(expected_losses[index]).margin(1e-15));
-  REQUIRE(result.audit[0].closure_error == 0.0);
-  REQUIRE(result.audit[1].closure_error == 0.0);
+  const auto adjoint = function.apply_adjoint_cpu(
+      1, {2.0, 3.0}, {5.0, 7.0}, {11.0});
+  REQUIRE(adjoint[0] ==
+          Catch::Approx(0.1 * 2.0 + 0.6 * 5.0 + 0.3 * 11.0));
+  REQUIRE(adjoint[1] ==
+          Catch::Approx(0.1 * 3.0 + 0.6 * 7.0 + 0.3 * 11.0));
 }

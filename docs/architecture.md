@@ -34,7 +34,7 @@ For source batch `B`, the absolute response is
 E = B (I + T + T² + ...) D
 ```
 
-The CPU and CUDA backends evaluate the same non-negative Neumann series.
+The CPU and CUDA backends evaluate the same bounded Neumann series.
 The CUDA implementation uses native cuSPARSE and cuBLAS in float64; it never
 calls Python or CuPy.
 
@@ -46,11 +46,14 @@ R_L = sum(n=0..6) T^n L
 u_7 = T^7 1
 ```
 
-including matrix-free nonlocal blocks. Operators and function assets remain
-resident on the GPU while identity-state batches are propagated. The
-resulting `effective.h5` is bound to the operator cache key. Source geometry
-remains continuous: a newly traced source batch `B` is evaluated as
-`direct + B R_D`, with corresponding losses and unresolved weight.
+including matrix-free nonlocal blocks. Precomputation propagates batches of
+sensitive-channel and loss terminal bases backward through the Euclidean
+adjoint of the complete transport operator; it never propagates one identity
+source per transport state. Operators and function assets remain resident on
+the GPU. The resulting `effective.h5` is bound to the operator cache key.
+Source geometry remains continuous: a newly traced source batch `B` is
+evaluated as `direct + B R_D`, with corresponding losses and unresolved
+weight.
 
 Regression normalizes each response across sensitive channels because emitted
 light yield is a nuisance parameter. A response grid stores
@@ -74,14 +77,16 @@ Custom surfaces are explicitly divided into two contracts:
   conservatively deposited into that basis. The plugin declares intrinsic
   losses and a distribution over rays expressed relative to its own surface
   group. Its intrinsic linear map may be supplied either as explicit CSR
-  matrices or through `oos_function_operator_v1`. The latter permits
+  matrices or through `oos_function_operator_v2`. The latter permits
   factorized, modal, FFT, or other matrix-free implementations without
   changing the core contract. The core traces the declared egress rays and
   composes their geometry-dependent destinations into the global operator.
 
 Both contracts use `oos_surface_plugin_v3`; scene locality must match the
 plugin ABI declaration. A functional nonlocal implementation additionally
-exports `oos_get_function_operator_v1`. Its assembled state layout is
+exports `oos_get_function_operator_v2`. V2 requires paired linear forward and
+Euclidean-adjoint callbacks on every supported backend. Input-dependent
+clipping and renormalization are outside the ABI. Its assembled state layout is
 
 ```text
 [ordinary Lambertian/local-plugin states,

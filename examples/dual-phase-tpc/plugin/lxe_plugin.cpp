@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -433,7 +432,7 @@ oos_plugin_validation_v1 validate_function(oos_string_view_v1 config,
 
 int32_t create_function(oos_string_view_v1 config, double,
                         void** instance,
-                        oos_function_operator_descriptor_v1* descriptor) {
+                        oos_function_operator_descriptor_v2* descriptor) {
   try {
     const auto parsed = nlohmann::json::parse(
         std::string(config.data ? config.data : "", config.size));
@@ -446,7 +445,7 @@ int32_t create_function(oos_string_view_v1 config, double,
     const double contraction =
         *std::max_element(value->expected_return.begin(),
                           value->expected_return.end());
-    *descriptor = {OOS_FUNCTION_OPERATOR_ABI_V1, states, states, egress, 1,
+    *descriptor = {OOS_FUNCTION_OPERATOR_ABI_V2, states, states, egress, 1,
                    contraction, 1,
 #ifdef OOS_LXE_HAS_CUDA
                    1
@@ -470,8 +469,7 @@ void destroy_function(void* instance) {
 
 int32_t apply_function_cpu(
     void* opaque, std::uint64_t batch, const double* input,
-    double* retained, double* egress, double* losses,
-    oos_function_operator_audit_v1* audit) {
+    double* retained, double* egress, double* losses) {
   try {
     const auto& function = *static_cast<LXeFunctionInstance*>(opaque);
     const auto state_count =
@@ -484,8 +482,6 @@ int32_t apply_function_cpu(
     std::fill(losses, losses + batch, 0.0);
     constexpr double two_pi =
         6.283185307179586476925286766559005768;
-    std::atomic<bool> invalid_surface{false};
-
 #pragma omp parallel for schedule(static)
     for (std::int64_t signed_row = 0;
          signed_row < static_cast<std::int64_t>(batch); ++signed_row) {
@@ -500,33 +496,29 @@ int32_t apply_function_cpu(
                direction_phi < function.nd; ++direction_phi) {
             const auto expected_index =
                 (direction_phi * function.nr + radial) * function.nm + mu;
-            double position_sum = 0.0;
             std::vector<std::complex<double>> position_modes(
                 function.orders, {0.0, 0.0});
             for (std::uint64_t position_phi = 0;
                  position_phi < function.np; ++position_phi) {
               const auto state =
-                  (((radial * function.np + position_phi) * function.nm + mu) *
+                  (((radial * function.np + position_phi) * function.nm +
+                    mu) *
                        function.nd +
                    direction_phi);
               const double value = input[row * state_count + state];
-              position_sum += value;
               input_weight += value;
+              expected_weight +=
+                  value * function.expected_return[expected_index];
               const double phi =
                   two_pi * static_cast<double>(position_phi) /
                   static_cast<double>(function.np);
-              for (std::uint64_t order = 0;
-                   order < function.orders; ++order)
+              for (std::uint64_t order = 0; order < function.orders;
+                   ++order)
                 position_modes[order] +=
-                    value *
-                    std::exp(std::complex<double>{
-                        0.0, -static_cast<double>(order) * phi});
+                    value * std::exp(std::complex<double>{
+                                0.0, -static_cast<double>(order) * phi});
             }
-            expected_weight +=
-                position_sum *
-                function.expected_return[expected_index];
-            for (std::uint64_t order = 0;
-                 order < function.orders; ++order)
+            for (std::uint64_t order = 0; order < function.orders; ++order)
               for (std::uint64_t surface = 0;
                    surface < function.surface_radial; ++surface) {
                 const auto coefficient =
@@ -542,9 +534,6 @@ int32_t apply_function_cpu(
                     function.coefficients[coefficient];
               }
           }
-
-      std::vector<double> surface_weights(surface_count, 0.0);
-      double positive_total = 0.0;
       for (std::uint64_t surface = 0;
            surface < function.surface_radial; ++surface)
         for (std::uint64_t position_phi = 0;
@@ -553,37 +542,120 @@ int32_t apply_function_cpu(
               two_pi * (static_cast<double>(position_phi) + 0.5) /
               static_cast<double>(function.surface_phi);
           std::complex<double> density{0.0, 0.0};
-          for (std::uint64_t order = 0;
-               order < function.orders; ++order)
+          for (std::uint64_t order = 0; order < function.orders; ++order)
             density +=
                 modal[order * function.surface_radial + surface] *
                 std::exp(std::complex<double>{
                     0.0, static_cast<double>(order) * phi});
-          const double raw =
+          const double surface_weight =
               density.real() * function.surface_ring_area[surface] /
               static_cast<double>(function.surface_phi);
           const auto surface_index =
               surface * function.surface_phi + position_phi;
-          surface_weights[surface_index] = std::max(0.0, raw);
-          positive_total += surface_weights[surface_index];
+          for (std::uint64_t angle = 0; angle < function.angular; ++angle)
+            egress[row * egress_count +
+                   surface_index * function.angular + angle] =
+                surface_weight * function.angular_weight[angle];
         }
-      if (expected_weight > 0.0 && !(positive_total > 0.0))
-        invalid_surface.store(true, std::memory_order_relaxed);
-      const double normalization =
-          positive_total > 0.0 ? expected_weight / positive_total : 1.0;
-      for (std::uint64_t surface = 0; surface < surface_count; ++surface)
-        for (std::uint64_t angle = 0; angle < function.angular; ++angle)
-          egress[row * egress_count + surface * function.angular + angle] =
-              surface_weights[surface] * normalization *
-              function.angular_weight[angle];
-      const double loss = std::max(0.0, input_weight - expected_weight);
-      losses[row] = loss;
-      audit[row] = {input_weight, 0.0, expected_weight, loss,
-                    expected_weight + loss - input_weight};
+      losses[row] = input_weight - expected_weight;
     }
-    if (invalid_surface.load(std::memory_order_relaxed))
-      throw std::runtime_error(
-          "factorized LXe function produced no positive surface weight");
+    return 0;
+  } catch (const std::exception& exception) {
+    message = exception.what();
+    return 2;
+  }
+}
+
+int32_t apply_function_adjoint_cpu(
+    void* opaque, std::uint64_t batch, const double* retained_adjoint,
+    const double* egress_adjoint, const double* losses_adjoint,
+    double* input_adjoint) {
+  try {
+    const auto& function = *static_cast<LXeFunctionInstance*>(opaque);
+    const auto state_count =
+        function.nr * function.np * function.nm * function.nd;
+    const auto surface_count =
+        function.surface_radial * function.surface_phi;
+    const auto egress_count = surface_count * function.angular;
+    (void)retained_adjoint;
+    std::fill(input_adjoint, input_adjoint + batch * state_count, 0.0);
+    constexpr double two_pi =
+        6.283185307179586476925286766559005768;
+#pragma omp parallel for schedule(static)
+    for (std::int64_t signed_row = 0;
+         signed_row < static_cast<std::int64_t>(batch); ++signed_row) {
+      const auto row = static_cast<std::uint64_t>(signed_row);
+      std::vector<std::complex<double>> surface_modes(
+          function.orders * function.surface_radial, {0.0, 0.0});
+      for (std::uint64_t surface = 0;
+           surface < function.surface_radial; ++surface)
+        for (std::uint64_t position_phi = 0;
+             position_phi < function.surface_phi; ++position_phi) {
+          const auto surface_index =
+              surface * function.surface_phi + position_phi;
+          double seed = 0.0;
+          for (std::uint64_t angle = 0; angle < function.angular; ++angle)
+            seed += egress_adjoint[
+                        row * egress_count +
+                        surface_index * function.angular + angle] *
+                    function.angular_weight[angle];
+          seed *= function.surface_ring_area[surface] /
+                  static_cast<double>(function.surface_phi);
+          const double phi =
+              two_pi * (static_cast<double>(position_phi) + 0.5) /
+              static_cast<double>(function.surface_phi);
+          for (std::uint64_t order = 0; order < function.orders; ++order)
+            surface_modes[order * function.surface_radial + surface] +=
+                seed * std::exp(std::complex<double>{
+                           0.0, static_cast<double>(order) * phi});
+        }
+      for (std::uint64_t radial = 0; radial < function.nr; ++radial)
+        for (std::uint64_t mu = 0; mu < function.nm; ++mu)
+          for (std::uint64_t direction_phi = 0;
+               direction_phi < function.nd; ++direction_phi) {
+            const auto expected_index =
+                (direction_phi * function.nr + radial) * function.nm + mu;
+            std::vector<std::complex<double>> phase_adjoint(
+                function.orders, {0.0, 0.0});
+            for (std::uint64_t order = 0; order < function.orders; ++order)
+              for (std::uint64_t surface = 0;
+                   surface < function.surface_radial; ++surface) {
+                const auto coefficient =
+                    ((((direction_phi * function.nr + radial) *
+                           function.nm +
+                       mu) *
+                          function.orders +
+                      order) *
+                         function.surface_radial +
+                     surface);
+                phase_adjoint[order] +=
+                    function.coefficients[coefficient] *
+                    surface_modes[order * function.surface_radial + surface];
+              }
+            for (std::uint64_t position_phi = 0;
+                 position_phi < function.np; ++position_phi) {
+              const double phi =
+                  two_pi * static_cast<double>(position_phi) /
+                  static_cast<double>(function.np);
+              double value =
+                  losses_adjoint[row] *
+                  (1.0 - function.expected_return[expected_index]);
+              for (std::uint64_t order = 0; order < function.orders;
+                   ++order)
+                value +=
+                    (phase_adjoint[order] *
+                     std::exp(std::complex<double>{
+                         0.0, -static_cast<double>(order) * phi}))
+                        .real();
+              const auto state =
+                  (((radial * function.np + position_phi) * function.nm +
+                    mu) *
+                       function.nd +
+                   direction_phi);
+              input_adjoint[row * state_count + state] = value;
+            }
+          }
+    }
     return 0;
   } catch (const std::exception& exception) {
     message = exception.what();
@@ -599,10 +671,22 @@ int32_t prepare_function_cuda(void* instance, std::int32_t device) {
 int32_t apply_function_cuda(
     void* instance, std::uint64_t batch, const double* device_input,
     double* device_retained, double* device_egress, double* device_losses,
-    void* cuda_stream, oos_function_operator_audit_v1* host_audit) {
+    void* cuda_stream) {
   return apply_lxe_function_cuda(
       static_cast<LXeFunctionInstance*>(instance), batch, device_input,
-      device_retained, device_egress, device_losses, cuda_stream, host_audit);
+      device_retained, device_egress, device_losses, cuda_stream);
+}
+
+int32_t apply_function_adjoint_cuda(
+    void* instance, std::uint64_t batch,
+    const double* device_retained_adjoint,
+    const double* device_egress_adjoint,
+    const double* device_losses_adjoint, double* device_input_adjoint,
+    void* cuda_stream) {
+  return apply_lxe_function_adjoint_cuda(
+      static_cast<LXeFunctionInstance*>(instance), batch,
+      device_retained_adjoint, device_egress_adjoint,
+      device_losses_adjoint, device_input_adjoint, cuda_stream);
 }
 
 const oos_surface_plugin_v3 plugin{
@@ -617,18 +701,21 @@ const oos_surface_plugin_v3 plugin{
     16,
 };
 
-const oos_function_operator_v1 function_operator{
-    OOS_FUNCTION_OPERATOR_ABI_V1,
+const oos_function_operator_v2 function_operator{
+    OOS_FUNCTION_OPERATOR_ABI_V2,
     {"oos_lxe_factorized", 18},
-    {"0.4.0", 5},
+    {"0.5.0", 5},
     validate_function,
     create_function,
     destroy_function,
     apply_function_cpu,
+    apply_function_adjoint_cpu,
 #ifdef OOS_LXE_HAS_CUDA
     prepare_function_cuda,
     apply_function_cuda,
+    apply_function_adjoint_cuda,
 #else
+    nullptr,
     nullptr,
     nullptr,
 #endif
@@ -640,7 +727,7 @@ oos_get_surface_plugin_v3(void) {
   return &plugin;
 }
 
-extern "C" OOS_PLUGIN_EXPORT const oos_function_operator_v1*
-oos_get_function_operator_v1(void) {
+extern "C" OOS_PLUGIN_EXPORT const oos_function_operator_v2*
+oos_get_function_operator_v2(void) {
   return &function_operator;
 }

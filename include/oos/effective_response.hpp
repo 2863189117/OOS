@@ -17,6 +17,9 @@ struct EffectiveResponse {
   std::uint64_t channels{};
   std::uint64_t losses{};
   std::uint32_t cycles{7};
+  std::uint64_t build_batch_size{64};
+  double operator_tolerance{1.0e-10};
+  std::string construction_method{"adjoint_linear"};
   std::vector<double> state_to_detection;
   std::vector<double> state_to_losses;
   std::vector<double> state_unresolved;
@@ -28,9 +31,12 @@ struct EffectiveResponse {
   void validate() const;
 };
 
+// Builds the bounded response by propagating terminal bases through the
+// adjoint transport operator. There is intentionally no forward-basis
+// precompute implementation.
 EffectiveResponse build_effective_response_cpu(const OperatorSet& operators,
-                                               std::uint32_t cycles = 7,
-                                               std::uint64_t batch_size = 32);
+                                                std::uint32_t cycles = 7,
+                                                std::uint64_t batch_size = 32);
 
 SolveResult apply_effective_response_cpu(const EffectiveResponse& response,
                                          const SourceBatch& sources);

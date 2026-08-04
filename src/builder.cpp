@@ -261,7 +261,7 @@ struct CustomSurfaceRuntime {
   std::uint64_t state_count{};
   std::int32_t nonlocal_domain_id{-1};
   bool functional{};
-  oos_function_operator_descriptor_v1 function_descriptor{};
+  oos_function_operator_descriptor_v2 function_descriptor{};
 };
 
 using CustomRuntimeMap =

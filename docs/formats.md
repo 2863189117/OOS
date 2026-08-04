@@ -153,13 +153,16 @@ Its metadata contains
 `{"locality":"nonlocal","loss_names":[...]}`. A function implementation
 instead emits metadata
 `{"locality":"nonlocal","execution":"function","state_count":Ns,
-"loss_names":[...]}` and exports `oos_get_function_operator_v1`. The
+"loss_names":[...]}` and exports `oos_get_function_operator_v2`. The
 function consumes a row-major batch `[B,Ns]` and returns retained state
-`[B,Ns]`, egress coefficients `[B,Ne]`, intrinsic losses `[B,Nl]`, and
-per-row energy audits. It must be deterministic, linear, nonnegative, and
-passive. The implementation may internally use factorized arrays, modal
-coefficients, FFTs, or a matrix, but those details are outside the core
-schema.
+`[B,Ns]`, egress coefficients `[B,Ne]`, and intrinsic losses `[B,Nl]`. It
+also consumes adjoints of those three outputs and returns the Euclidean
+adjoint in `[B,Ns]`. The two actions must satisfy their inner-product identity.
+They represent the deterministic linear physical map and must not perform
+input-dependent clipping or renormalization. A truncated spectral basis may
+contain signed intermediate coefficients. The implementation may internally
+use factorized arrays, modal coefficients, FFTs, or a matrix, but those
+details are outside the core schema.
 
 The scene config must name `nonlocal_domain_id`; every triangle in the
 surface group must separate that domain from another declared medium.
@@ -235,7 +238,7 @@ not included in this bound. The source-integration dataset is the accumulated
 parent/child L1 difference of the accepted shape-factor quadrature. It is an
 a-posteriori convergence diagnostic rather than a rigorous upper bound.
 
-## Bounded effective response
+## Adjoint bounded effective response
 
 `oos-efficiency precompute` writes:
 
@@ -245,11 +248,18 @@ a-posteriori convergence diagnostic rather than a rigorous upper bound.
 /effective/state_unresolved    float64 [Nstate]
 /effective/channel_id          int32   [Nchannel]
 /metadata/cycles               uint32  [1]
+/metadata/build_batch_size     uint64  [1]
+/metadata/operator_tolerance   float64 [1]
+/metadata/construction_method  string: adjoint_linear
 /metadata/operator_cache_key_sha256
 ```
 
-The default is seven complete bounded Neumann cycles. The file is invalidated
-when the originating `operators.h5` cache key changes.
+The schema is `oos.effective-adjoint-response.v2`. The default is seven
+complete bounded Neumann cycles. Terminal channel and loss bases are
+propagated through the complete adjoint operator, including matrix-free
+function blocks. The file is invalidated when the originating `operators.h5`
+cache key changes. The former forward-basis v1 response schema is deliberately
+unsupported.
 
 ## Regression input and response grids
 

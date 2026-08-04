@@ -136,6 +136,35 @@ void write_factorized_block(const std::filesystem::path& path) {
           {generator.size()});
   H5Fclose(file);
 }
+
+void write_complex_adjoint_block(const std::filesystem::path& path) {
+  const auto file =
+      H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(file >= 0);
+  group(file, "/function");
+  group(file, "/metadata");
+  dataset(file, "/function/coefficients_real", H5T_NATIVE_DOUBLE,
+          std::vector<double>{0.18, 0.07}, {1, 1, 1, 2, 1});
+  dataset(file, "/function/coefficients_imag", H5T_NATIVE_DOUBLE,
+          std::vector<double>{0.0, -0.03}, {1, 1, 1, 2, 1});
+  dataset(file, "/function/expected_return", H5T_NATIVE_DOUBLE,
+          std::vector<double>{0.45}, {1, 1, 1});
+  dataset(file, "/function/surface_ring_area_mm2", H5T_NATIVE_DOUBLE,
+          std::vector<double>{1.7}, {1});
+  dataset(file, "/function/angular_weight", H5T_NATIVE_DOUBLE,
+          std::vector<double>{0.25, 0.75}, {2});
+  const std::string grid =
+      R"({"position_radial_bins":1,"position_phi_bins":3,"direction_mu_bins":1,"direction_phi_bins":1})";
+  const std::string generator =
+      R"({"schema":"oos.nonlocal.function.v1","state_count":3,"egress_count":8,"surface_phi_bins":4,"angular_count":2,"contraction_bound":0.45})";
+  dataset(file, "/metadata/phase_grid_json", H5T_NATIVE_UINT8,
+          std::vector<std::uint8_t>(grid.begin(), grid.end()),
+          {grid.size()});
+  dataset(file, "/metadata/generator_json", H5T_NATIVE_UINT8,
+          std::vector<std::uint8_t>(generator.begin(), generator.end()),
+          {generator.size()});
+  H5Fclose(file);
+}
 }  // namespace
 
 #ifdef OOS_TEST_LXE_PLUGIN_PATH
@@ -262,6 +291,20 @@ TEST_CASE("LXe factorized block executes through the function ABI") {
   REQUIRE(applied.losses[0] == Catch::Approx(0.6).margin(1.0e-12));
   REQUIRE(applied.egress[1] == Catch::Approx(0.1).margin(1.0e-12));
   REQUIRE(applied.losses[1] == Catch::Approx(0.15).margin(1.0e-12));
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("LXe complex Fourier action and adjoint satisfy duality") {
+  const auto path = std::filesystem::temp_directory_path() /
+                    "oos-lxe-complex-adjoint.h5";
+  write_complex_adjoint_block(path);
+  const auto config =
+      nlohmann::json{{"geometry", "finite_cylinder"},
+                     {"explicit_collision_order", 7},
+                     {"factorized_block_hdf5", path.string()}}
+          .dump();
+  oos::FunctionOperator function(OOS_TEST_LXE_PLUGIN_PATH, config, 7.0);
+  oos::validate_function_operator(function, 1.0e-12);
   std::filesystem::remove(path);
 }
 #endif

@@ -104,6 +104,12 @@ struct DeviceCsr {
         "cusparseCreateCsr");
   }
   ~DeviceCsr() {
+    if (input_descriptor) cusparseDestroyDnMat(input_descriptor);
+    if (output_descriptor) cusparseDestroyDnMat(output_descriptor);
+    if (adjoint_input_descriptor)
+      cusparseDestroyDnMat(adjoint_input_descriptor);
+    if (adjoint_output_descriptor)
+      cusparseDestroyDnMat(adjoint_output_descriptor);
     if (descriptor) cusparseDestroySpMat(descriptor);
   }
   DeviceCsr(const DeviceCsr&) = delete;
@@ -115,48 +121,140 @@ struct DeviceCsr {
   DeviceBuffer<std::uint64_t> indptr;
   DeviceBuffer<std::uint64_t> indices;
   DeviceBuffer<double> values;
+  DeviceBuffer<std::byte> spmm_workspace;
+  DeviceBuffer<std::byte> adjoint_spmm_workspace;
   cusparseSpMatDescr_t descriptor{};
+  cusparseDnMatDescr_t input_descriptor{};
+  cusparseDnMatDescr_t output_descriptor{};
+  std::uint64_t dense_batch{};
+  bool spmm_prepared{};
+  cusparseDnMatDescr_t adjoint_input_descriptor{};
+  cusparseDnMatDescr_t adjoint_output_descriptor{};
+  std::uint64_t adjoint_dense_batch{};
+  bool adjoint_spmm_prepared{};
 };
 
-void right_multiply(cusparseHandle_t handle, const DeviceCsr& matrix,
+void right_multiply(cusparseHandle_t handle, DeviceCsr& matrix,
                     const double* input, std::uint64_t batch, double* output) {
   // A host row-major [batch, rows] is the same memory layout as a
   // column-major [rows, batch].  Compute A^T B so the output column-major
   // [cols, batch] is again host-compatible row-major [batch, cols].
-  cusparseDnMatDescr_t input_descriptor{};
-  cusparseDnMatDescr_t output_descriptor{};
-  check_sparse(cusparseCreateDnMat(
-                   &input_descriptor, static_cast<std::int64_t>(matrix.rows),
-                   static_cast<std::int64_t>(batch),
-                   static_cast<std::int64_t>(matrix.rows),
-                   const_cast<double*>(input), CUDA_R_64F, CUSPARSE_ORDER_COL),
-               "cusparseCreateDnMat(input)");
-  check_sparse(cusparseCreateDnMat(
-                   &output_descriptor, static_cast<std::int64_t>(matrix.cols),
-                   static_cast<std::int64_t>(batch),
-                   static_cast<std::int64_t>(matrix.cols), output, CUDA_R_64F,
-                   CUSPARSE_ORDER_COL),
-               "cusparseCreateDnMat(output)");
+  if (matrix.dense_batch != batch) {
+    if (matrix.input_descriptor)
+      cusparseDestroyDnMat(matrix.input_descriptor);
+    if (matrix.output_descriptor)
+      cusparseDestroyDnMat(matrix.output_descriptor);
+    matrix.input_descriptor = nullptr;
+    matrix.output_descriptor = nullptr;
+    matrix.spmm_prepared = false;
+    check_sparse(
+        cusparseCreateDnMat(
+            &matrix.input_descriptor,
+            static_cast<std::int64_t>(matrix.rows),
+            static_cast<std::int64_t>(batch),
+            static_cast<std::int64_t>(matrix.rows),
+            const_cast<double*>(input), CUDA_R_64F, CUSPARSE_ORDER_COL),
+        "cusparseCreateDnMat(input)");
+    check_sparse(cusparseCreateDnMat(
+                     &matrix.output_descriptor,
+                     static_cast<std::int64_t>(matrix.cols),
+                     static_cast<std::int64_t>(batch),
+                     static_cast<std::int64_t>(matrix.cols), output,
+                     CUDA_R_64F, CUSPARSE_ORDER_COL),
+                 "cusparseCreateDnMat(output)");
+    matrix.dense_batch = batch;
+  } else {
+    check_sparse(cusparseDnMatSetValues(matrix.input_descriptor,
+                                        const_cast<double*>(input)),
+                 "cusparseDnMatSetValues(input)");
+    check_sparse(cusparseDnMatSetValues(matrix.output_descriptor, output),
+                 "cusparseDnMatSetValues(output)");
+  }
   const double alpha = 1.0;
   const double beta = 0.0;
-  std::size_t workspace_size{};
-  check_sparse(
-      cusparseSpMM_bufferSize(
-          handle, CUSPARSE_OPERATION_TRANSPOSE,
-          CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matrix.descriptor,
-          input_descriptor, &beta, output_descriptor, CUDA_R_64F,
-          CUSPARSE_SPMM_ALG_DEFAULT, &workspace_size),
-      "cusparseSpMM_bufferSize");
-  DeviceBuffer<std::byte> workspace(workspace_size);
+  if (!matrix.spmm_prepared) {
+    std::size_t workspace_size{};
+    check_sparse(
+        cusparseSpMM_bufferSize(
+            handle, CUSPARSE_OPERATION_TRANSPOSE,
+            CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matrix.descriptor,
+            matrix.input_descriptor, &beta, matrix.output_descriptor,
+            CUDA_R_64F, CUSPARSE_SPMM_ALG_DEFAULT, &workspace_size),
+        "cusparseSpMM_bufferSize");
+    if (matrix.spmm_workspace.size() < workspace_size)
+      matrix.spmm_workspace = DeviceBuffer<std::byte>(workspace_size);
+    matrix.spmm_prepared = true;
+  }
   check_sparse(cusparseSpMM(
                    handle, CUSPARSE_OPERATION_TRANSPOSE,
                    CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
-                   matrix.descriptor, input_descriptor, &beta,
-                   output_descriptor, CUDA_R_64F,
-                   CUSPARSE_SPMM_ALG_DEFAULT, workspace.data()),
+                   matrix.descriptor, matrix.input_descriptor, &beta,
+                   matrix.output_descriptor, CUDA_R_64F,
+                   CUSPARSE_SPMM_ALG_DEFAULT,
+                   matrix.spmm_workspace.data()),
                "cusparseSpMM");
-  cusparseDestroyDnMat(input_descriptor);
-  cusparseDestroyDnMat(output_descriptor);
+}
+
+void adjoint_multiply(cusparseHandle_t handle, DeviceCsr& matrix,
+                      const double* input, std::uint64_t batch,
+                      double* output) {
+  if (matrix.adjoint_dense_batch != batch) {
+    if (matrix.adjoint_input_descriptor)
+      cusparseDestroyDnMat(matrix.adjoint_input_descriptor);
+    if (matrix.adjoint_output_descriptor)
+      cusparseDestroyDnMat(matrix.adjoint_output_descriptor);
+    matrix.adjoint_input_descriptor = nullptr;
+    matrix.adjoint_output_descriptor = nullptr;
+    matrix.adjoint_spmm_prepared = false;
+    check_sparse(
+        cusparseCreateDnMat(
+            &matrix.adjoint_input_descriptor,
+            static_cast<std::int64_t>(matrix.cols),
+            static_cast<std::int64_t>(batch),
+            static_cast<std::int64_t>(matrix.cols),
+            const_cast<double*>(input), CUDA_R_64F, CUSPARSE_ORDER_COL),
+        "cusparseCreateDnMat(adjoint input)");
+    check_sparse(cusparseCreateDnMat(
+                     &matrix.adjoint_output_descriptor,
+                     static_cast<std::int64_t>(matrix.rows),
+                     static_cast<std::int64_t>(batch),
+                     static_cast<std::int64_t>(matrix.rows), output,
+                     CUDA_R_64F, CUSPARSE_ORDER_COL),
+                 "cusparseCreateDnMat(adjoint output)");
+    matrix.adjoint_dense_batch = batch;
+  } else {
+    check_sparse(cusparseDnMatSetValues(
+                     matrix.adjoint_input_descriptor,
+                     const_cast<double*>(input)),
+                 "cusparseDnMatSetValues(adjoint input)");
+    check_sparse(cusparseDnMatSetValues(matrix.adjoint_output_descriptor,
+                                        output),
+                 "cusparseDnMatSetValues(adjoint output)");
+  }
+  const double alpha = 1.0;
+  const double beta = 0.0;
+  if (!matrix.adjoint_spmm_prepared) {
+    std::size_t workspace_size{};
+    check_sparse(
+        cusparseSpMM_bufferSize(
+            handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matrix.descriptor,
+            matrix.adjoint_input_descriptor, &beta,
+            matrix.adjoint_output_descriptor, CUDA_R_64F,
+            CUSPARSE_SPMM_ALG_DEFAULT, &workspace_size),
+        "cusparseSpMM_bufferSize(adjoint)");
+    if (matrix.adjoint_spmm_workspace.size() < workspace_size)
+      matrix.adjoint_spmm_workspace = DeviceBuffer<std::byte>(workspace_size);
+    matrix.adjoint_spmm_prepared = true;
+  }
+  check_sparse(
+      cusparseSpMM(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                   CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                   matrix.descriptor, matrix.adjoint_input_descriptor, &beta,
+                   matrix.adjoint_output_descriptor, CUDA_R_64F,
+                   CUSPARSE_SPMM_ALG_DEFAULT,
+                   matrix.adjoint_spmm_workspace.data()),
+      "cusparseSpMM(adjoint)");
 }
 
 __global__ void row_sums(const double* values, std::uint64_t rows,
@@ -216,6 +314,19 @@ __global__ void add_intrinsic_losses(
   global[row * global_count + columns[loss]] += local[linear];
 }
 
+__global__ void gather_intrinsic_losses(
+    const double* global, std::uint64_t batch, std::uint64_t local_count,
+    const std::uint32_t* columns, std::uint64_t global_count,
+    double* local) {
+  const auto linear =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto total = batch * local_count;
+  if (linear >= total) return;
+  const auto row = linear / local_count;
+  const auto loss = linear % local_count;
+  local[linear] = global[row * global_count + columns[loss]];
+}
+
 struct DeviceFunctionBlock {
   DeviceFunctionBlock(const FunctionBlock& source, double energy_eV,
                       double tolerance, std::uint64_t batch,
@@ -231,6 +342,7 @@ struct DeviceFunctionBlock {
         input(batch * source.state_count),
         retained(batch * source.state_count),
         egress(batch * source.egress_count),
+        adjoint_egress_scratch(batch * source.egress_count),
         intrinsic_losses(batch * source.intrinsic_loss_count),
         coupled_state(batch * global_states),
         coupled_detection(batch * global_channels),
@@ -263,6 +375,7 @@ struct DeviceFunctionBlock {
   DeviceBuffer<double> input;
   DeviceBuffer<double> retained;
   DeviceBuffer<double> egress;
+  DeviceBuffer<double> adjoint_egress_scratch;
   DeviceBuffer<double> intrinsic_losses;
   DeviceBuffer<double> coupled_state;
   DeviceBuffer<double> coupled_detection;
@@ -495,7 +608,11 @@ EffectiveResponse build_effective_response_cuda(
   response.channels = operators.detection.cols;
   response.losses = operators.losses.cols;
   response.cycles = cycles;
-  response.state_to_detection.assign(response.states * response.channels, 0.0);
+  response.build_batch_size = batch_size;
+  response.operator_tolerance = operators.tolerance;
+  response.construction_method = "adjoint_linear";
+  response.state_to_detection.assign(response.states * response.channels,
+                                     0.0);
   response.state_to_losses.assign(response.states * response.losses, 0.0);
   response.state_unresolved.assign(response.states, 0.0);
   response.channel_ids = operators.channel_ids;
@@ -507,153 +624,160 @@ EffectiveResponse build_effective_response_cuda(
   check_sparse(cusparseCreate(&sparse), "cusparseCreate");
   check_blas(cublasCreate(&blas), "cublasCreate");
   try {
-    // Operators and function assets stay resident for the complete build.
-    // Only each identity-row batch and its terminal response cross PCIe.
     DeviceCsr transition(operators.transition);
     DeviceCsr detection(operators.detection);
     DeviceCsr loss_operator(operators.losses);
-    DeviceBuffer<double> current(batch_size * response.states);
-    DeviceBuffer<double> next(batch_size * response.states);
-    DeviceBuffer<double> detected(batch_size * response.channels);
-    DeviceBuffer<double> lost(batch_size * response.losses);
-    DeviceBuffer<double> efficiency(batch_size * response.channels);
-    DeviceBuffer<double> loss_totals(batch_size * response.losses);
-    DeviceBuffer<double> unresolved(batch_size);
+    DeviceBuffer<double> next_state(batch_size * response.states);
+    DeviceBuffer<double> current_state(batch_size * response.states);
+    DeviceBuffer<double> state_scratch(batch_size * response.states);
+    DeviceBuffer<double> detection_seed(batch_size * response.channels);
+    DeviceBuffer<double> loss_seed(batch_size * response.losses);
     std::vector<std::unique_ptr<DeviceFunctionBlock>> function_blocks;
     function_blocks.reserve(operators.function_blocks.size());
-    for (const auto& block : operators.function_blocks)
-      function_blocks.push_back(std::make_unique<DeviceFunctionBlock>(
+    for (const auto& block : operators.function_blocks) {
+      auto runtime = std::make_unique<DeviceFunctionBlock>(
           block, operators.energy_eV, operators.tolerance, batch_size,
-          response.states, response.channels, response.losses));
-    std::vector<double> host_initial(batch_size * response.states, 0.0);
-    std::vector<double> host_efficiency(batch_size * response.channels);
-    std::vector<double> host_losses(batch_size * response.losses);
-    std::vector<double> host_unresolved(batch_size);
-    const double one = 1.0;
+          response.states, response.channels,
+          response.losses);
+      function_blocks.push_back(std::move(runtime));
+    }
     constexpr int threads = 256;
-    for (std::uint64_t start = 0; start < response.states;
-         start += batch_size) {
-      const auto count = std::min(batch_size, response.states - start);
-      std::fill(host_initial.begin(), host_initial.end(), 0.0);
-      for (std::uint64_t row = 0; row < count; ++row)
-        host_initial[row * response.states + start + row] = 1.0;
-      check_cuda(cudaMemcpy(current.data(), host_initial.data(),
-                            host_initial.size() * sizeof(double),
-                            cudaMemcpyHostToDevice),
-                 "copy effective identity batch");
-      check_cuda(cudaMemset(efficiency.data(), 0,
-                            efficiency.size() * sizeof(double)),
-                 "clear effective detection totals");
-      check_cuda(cudaMemset(loss_totals.data(), 0,
-                            loss_totals.size() * sizeof(double)),
-                 "clear effective loss totals");
-      for (std::uint32_t iteration = 0; iteration < cycles; ++iteration) {
-        right_multiply(sparse, detection, current.data(), batch_size,
-                       detected.data());
-        right_multiply(sparse, loss_operator, current.data(), batch_size,
-                       lost.data());
+    const double one = 1.0;
+    const auto apply_cycle = [&](std::uint64_t count) {
+      adjoint_multiply(sparse, transition, next_state.data(), count,
+                       current_state.data());
+      adjoint_multiply(sparse, detection, detection_seed.data(), count,
+                       state_scratch.data());
+      check_blas(cublasDaxpy(
+                     blas, static_cast<int>(count * response.states), &one,
+                     state_scratch.data(), 1, current_state.data(), 1),
+                 "accumulate adjoint direct detection");
+      adjoint_multiply(sparse, loss_operator, loss_seed.data(), count,
+                       state_scratch.data());
+      check_blas(cublasDaxpy(
+                     blas, static_cast<int>(count * response.states), &one,
+                     state_scratch.data(), 1, current_state.data(), 1),
+                 "accumulate adjoint direct losses");
+      for (auto& runtime : function_blocks) {
+        const auto& block = runtime->block;
+        const auto state_values = count * block.state_count;
+        gather_state_slice<<<
+            static_cast<unsigned int>(
+                (state_values + threads - 1) / threads),
+            threads>>>(next_state.data(), count, response.states,
+                       block.state_offset, block.state_count,
+                       runtime->retained.data());
+        check_cuda(cudaGetLastError(),
+                   "gather adjoint functional retained values");
+        adjoint_multiply(sparse, runtime->egress_to_transition,
+                         next_state.data(), count, runtime->egress.data());
+        adjoint_multiply(sparse, runtime->egress_to_detection,
+                         detection_seed.data(), count,
+                         runtime->adjoint_egress_scratch.data());
         check_blas(cublasDaxpy(
-                       blas, static_cast<int>(efficiency.size()), &one,
-                       detected.data(), 1, efficiency.data(), 1),
-                   "accumulate effective detection");
+                       blas, static_cast<int>(count * block.egress_count),
+                       &one, runtime->adjoint_egress_scratch.data(), 1,
+                       runtime->egress.data(), 1),
+                   "accumulate adjoint functional detection egress");
+        adjoint_multiply(sparse, runtime->egress_to_losses,
+                         loss_seed.data(), count,
+                         runtime->adjoint_egress_scratch.data());
         check_blas(cublasDaxpy(
-                       blas, static_cast<int>(loss_totals.size()), &one,
-                       lost.data(), 1, loss_totals.data(), 1),
-                   "accumulate effective losses");
-        right_multiply(sparse, transition, current.data(), batch_size,
-                       next.data());
-        for (auto& runtime : function_blocks) {
-          const auto& block = runtime->block;
-          const auto state_values = batch_size * block.state_count;
-          gather_state_slice<<<
-              static_cast<unsigned int>(
-                  (state_values + threads - 1) / threads),
-              threads>>>(current.data(), batch_size, response.states,
-                         block.state_offset, block.state_count,
-                         runtime->input.data());
-          check_cuda(cudaGetLastError(),
-                     "gather effective functional state slice");
-          runtime->function->apply_cuda(
-              batch_size, runtime->input.data(), runtime->retained.data(),
-              runtime->egress.data(), runtime->intrinsic_losses.data());
-          add_state_slice<<<
-              static_cast<unsigned int>(
-                  (state_values + threads - 1) / threads),
-              threads>>>(runtime->retained.data(), batch_size,
-                         block.state_count, block.state_offset,
-                         response.states, next.data());
-          check_cuda(cudaGetLastError(),
-                     "add effective functional retained states");
-          right_multiply(sparse, runtime->egress_to_transition,
-                         runtime->egress.data(), batch_size,
-                         runtime->coupled_state.data());
-          right_multiply(sparse, runtime->egress_to_detection,
-                         runtime->egress.data(), batch_size,
-                         runtime->coupled_detection.data());
-          right_multiply(sparse, runtime->egress_to_losses,
-                         runtime->egress.data(), batch_size,
-                         runtime->coupled_losses.data());
-          check_blas(cublasDaxpy(
-                         blas,
-                         static_cast<int>(runtime->coupled_state.size()),
-                         &one, runtime->coupled_state.data(), 1, next.data(),
-                         1),
-                     "accumulate effective functional states");
-          check_blas(cublasDaxpy(
-                         blas,
-                         static_cast<int>(
-                             runtime->coupled_detection.size()),
-                         &one, runtime->coupled_detection.data(), 1,
-                         efficiency.data(), 1),
-                     "accumulate effective functional detection");
-          check_blas(cublasDaxpy(
-                         blas,
-                         static_cast<int>(runtime->coupled_losses.size()),
-                         &one, runtime->coupled_losses.data(), 1,
-                         loss_totals.data(), 1),
-                     "accumulate effective functional losses");
-          const auto intrinsic_values =
-              batch_size * block.intrinsic_loss_count;
-          add_intrinsic_losses<<<
+                       blas, static_cast<int>(count * block.egress_count),
+                       &one, runtime->adjoint_egress_scratch.data(), 1,
+                       runtime->egress.data(), 1),
+                   "accumulate adjoint functional loss egress");
+        const auto intrinsic_values =
+            count * block.intrinsic_loss_count;
+        if (intrinsic_values != 0) {
+          gather_intrinsic_losses<<<
               static_cast<unsigned int>(
                   (intrinsic_values + threads - 1) / threads),
-              threads>>>(
-              runtime->intrinsic_losses.data(), batch_size,
-              block.intrinsic_loss_count,
-              runtime->intrinsic_loss_columns.data(), response.losses,
-              loss_totals.data());
+              threads>>>(loss_seed.data(), count,
+                         block.intrinsic_loss_count,
+                         runtime->intrinsic_loss_columns.data(),
+                         response.losses, runtime->intrinsic_losses.data());
           check_cuda(cudaGetLastError(),
-                     "accumulate effective intrinsic losses");
+                     "gather adjoint functional intrinsic losses");
         }
-        std::swap(current, next);
+        runtime->function->apply_adjoint_cuda(
+            count, runtime->retained.data(), runtime->egress.data(),
+            runtime->intrinsic_losses.data(), runtime->input.data());
+        add_state_slice<<<
+            static_cast<unsigned int>(
+                (state_values + threads - 1) / threads),
+            threads>>>(runtime->input.data(), count, block.state_count,
+                       block.state_offset, response.states,
+                       current_state.data());
+        check_cuda(cudaGetLastError(),
+                   "accumulate adjoint functional input states");
       }
-      row_sums<<<static_cast<unsigned int>(batch_size), 256>>>(
-          current.data(), batch_size, response.states, unresolved.data());
-      check_cuda(cudaGetLastError(), "sum effective unresolved rows");
-      check_cuda(cudaMemcpy(host_efficiency.data(), efficiency.data(),
-                            host_efficiency.size() * sizeof(double),
-                            cudaMemcpyDeviceToHost),
-                 "copy effective detection batch");
-      check_cuda(cudaMemcpy(host_losses.data(), loss_totals.data(),
-                            host_losses.size() * sizeof(double),
-                            cudaMemcpyDeviceToHost),
-                 "copy effective loss batch");
-      check_cuda(cudaMemcpy(host_unresolved.data(), unresolved.data(),
-                            host_unresolved.size() * sizeof(double),
-                            cudaMemcpyDeviceToHost),
-                 "copy effective unresolved batch");
-      for (std::uint64_t row = 0; row < count; ++row) {
-        std::copy_n(host_efficiency.begin() + row * response.channels,
-                    response.channels,
-                    response.state_to_detection.begin() +
-                        (start + row) * response.channels);
-        std::copy_n(host_losses.begin() + row * response.losses,
-                    response.losses,
-                    response.state_to_losses.begin() +
-                        (start + row) * response.losses);
-        response.state_unresolved[start + row] = host_unresolved[row];
-      }
-    }
+      std::swap(next_state, current_state);
+    };
+
+    std::vector<double> host_detection_seed(batch_size * response.channels,
+                                            0.0);
+    std::vector<double> host_loss_seed(batch_size * response.losses, 0.0);
+    std::vector<double> host_state(batch_size * response.states, 0.0);
+    const auto build_terminal =
+        [&](std::uint64_t terminal_count, bool is_detection,
+            std::vector<double>& output) {
+          for (std::uint64_t start = 0; start < terminal_count;
+               start += batch_size) {
+            const auto count = std::min(batch_size, terminal_count - start);
+            std::fill(host_detection_seed.begin(),
+                      host_detection_seed.end(), 0.0);
+            std::fill(host_loss_seed.begin(), host_loss_seed.end(), 0.0);
+            auto& host_seed =
+                is_detection ? host_detection_seed : host_loss_seed;
+            const auto columns =
+                is_detection ? response.channels : response.losses;
+            for (std::uint64_t row = 0; row < count; ++row)
+              host_seed[row * columns + start + row] = 1.0;
+            check_cuda(cudaMemcpy(detection_seed.data(),
+                                  host_detection_seed.data(),
+                                  count * response.channels * sizeof(double),
+                                  cudaMemcpyHostToDevice),
+                       "copy adjoint detection seeds");
+            check_cuda(cudaMemcpy(loss_seed.data(), host_loss_seed.data(),
+                                  count * response.losses * sizeof(double),
+                                  cudaMemcpyHostToDevice),
+                       "copy adjoint loss seeds");
+            check_cuda(cudaMemset(next_state.data(), 0,
+                                  count * response.states * sizeof(double)),
+                       "clear adjoint terminal state");
+            for (std::uint32_t cycle = 0; cycle < cycles; ++cycle)
+              apply_cycle(count);
+            check_cuda(cudaMemcpy(host_state.data(), next_state.data(),
+                                  count * response.states * sizeof(double),
+                                  cudaMemcpyDeviceToHost),
+                       "copy adjoint terminal response");
+            for (std::uint64_t state = 0; state < response.states; ++state)
+              for (std::uint64_t row = 0; row < count; ++row)
+                output[state * terminal_count + start + row] =
+                    host_state[row * response.states + state];
+          }
+        };
+    build_terminal(response.channels, true, response.state_to_detection);
+    build_terminal(response.losses, false, response.state_to_losses);
+
+    std::fill(host_state.begin(), host_state.end(), 0.0);
+    std::fill_n(host_state.begin(), response.states, 1.0);
+    check_cuda(cudaMemcpy(next_state.data(), host_state.data(),
+                          response.states * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "copy adjoint unresolved terminal");
+    check_cuda(cudaMemset(detection_seed.data(), 0,
+                          response.channels * sizeof(double)),
+               "clear adjoint unresolved detection seeds");
+    check_cuda(cudaMemset(loss_seed.data(), 0,
+                          response.losses * sizeof(double)),
+               "clear adjoint unresolved loss seeds");
+    for (std::uint32_t cycle = 0; cycle < cycles; ++cycle) apply_cycle(1);
+    check_cuda(cudaMemcpy(response.state_unresolved.data(), next_state.data(),
+                          response.states * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "copy adjoint unresolved response");
     cublasDestroy(blas);
     cusparseDestroy(sparse);
   } catch (...) {
@@ -773,7 +897,7 @@ SolveResult CudaEffectiveResponseRuntime::apply(const SourceBatch& sources) {
                     unresolved.data(), 1),
         "apply effective unresolved response");
     SolveResult result;
-    result.backend = "cuda-precomputed";
+    result.backend = "cuda-precomputed-adjoint";
     result.hardware = std::string(impl_->properties.name) + "; cuda=" +
                       std::to_string(CUDART_VERSION);
     result.efficiency.resize(efficiency.size());
