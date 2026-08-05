@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(OOS VERSION 0.1.0 LANGUAGES C CXX)
+project(OOS VERSION 0.2.0 LANGUAGES C CXX)
 
 # Production installs use the locked workspace dependency prefix. Preserve
 # non-system link directories in installed RPATHs so executables and plugins

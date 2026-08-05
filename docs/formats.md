@@ -26,16 +26,40 @@ receive a global primitive ID or domain ID.
 /geometry/minus_domain_id   int32   [Nt]
 /geometry/plus_domain_id    int32   [Nt]
 /geometry/channel_id        int32   [Nt]
+/geometry/triangle_transport                 uint8  [Nt]
+/geometry/triangle_source_quadrature         uint8  [Nt]
+/geometry/triangle_source_analytic_primitive uint32 [Nt]
 ```
 
-`surface_basis_id` is local to a surface. Geometry triangles with the same
-`(surface_id, surface_basis_id, primary-domain side)` share one diffuse
-radiance state. A missing dataset is the legacy exact-leaf convention: one
-state per reflective triangle. Geometry and basis are deliberately separate;
-refining the Embree mesh therefore does not force a larger transport matrix.
+All geometry arrays above are required and have the triangle count as their
+leading dimension. `surface_basis_id` is local to a surface. Geometry
+triangles with the same `(surface_id, surface_basis_id, primary-domain side)`
+share one diffuse radiance state. Geometry and basis are deliberately
+separate; refining the Embree mesh therefore does not force a larger
+transport matrix.
 When a state contains several triangles, incident power is accumulated into
 that state and outgoing Lambertian quadrature is distributed over its member
 triangles in proportion to physical area.
+
+Exact transport geometry may additionally be stored under `/analytic`.
+`/analytic/kind`, frames, parameters, surface/domain ownership, source
+integrals, and surface elements describe disks, annuli, finite cylinders,
+boxes, and perforated disks. Source declarations are fail-closed:
+
+```text
+/analytic/source_integral              uint8 [Na]
+/analytic/elements/source_visibility   uint8 [Ne]
+```
+
+`source_visibility` is `0` for ordinary ray-traced visibility, `1` for a
+declared direct receiver, and `2` for a receiver projected through its
+declared circular aperture. `source_integral=1` declares that a disk replaces
+the complete set of source triangles mapped to it by
+`triangle_source_analytic_primitive`. The runtime then integrates the exact
+circular disk in solid-angle coordinates instead of inheriting the validation
+mesh's triangle count. A value of `none` or `ray_traced` explicitly selects
+the general BVH path. Validation rejects unsupported kinds, missing triangle
+mappings, surface/domain mismatches, and incomplete aperture declarations.
 
 An optional nested hierarchy is stored alongside the fixed geometry:
 
@@ -111,6 +135,16 @@ solid angles or unnecessary child rays. The global L1
 error budget is divided across top-level boundary triangles and redistributed
 within each child tree according to accepted child weight. This mode currently
 requires an unpolarized isotropic source in a declared closed domain.
+
+Its required `backend` is `auto`, `generic_bvh`, or `structured_analytic`.
+`auto`
+consumes any explicit declarations above and falls back element by element;
+`generic_bvh` ignores them; `structured_analytic` fails if an outward source
+candidate lacks a supported declaration. Structured disk integration accepts
+`structured_disk_mu_order` and `structured_disk_phi_count`. The default
+`31 x 64` rule uses embedded Gauss-Kronrod 15/31 direction-cosine weights and
+an embedded periodic 32/64 azimuth rule, so its lower-order L1 error estimate
+reuses the same ray traces.
 
 Spatial and angular or shape-factor weights are normalized independently.
 
@@ -257,14 +291,16 @@ a-posteriori convergence diagnostic rather than a rigorous upper bound.
 /metadata/operator_tolerance   float64 [1]
 /metadata/construction_method  string: adjoint_linear
 /metadata/operator_cache_key_sha256
+/metadata/fingerprint_sha256  semantic response identity
 ```
 
-The schema is `oos.effective-adjoint-response.v2`. The default is seven
+The schema is `oos.effective-adjoint-response.v3`. Its semantic fingerprint is
+required and verified while loading. The default is seven
 complete bounded Neumann cycles. Terminal channel and loss bases are
 propagated through the complete adjoint operator, including matrix-free
 function blocks. The file is invalidated when the originating `operators.h5`
-cache key changes. The former forward-basis v1 response schema is deliberately
-unsupported.
+cache key or recorded response semantics change. Earlier response schemas are
+not accepted.
 
 ## Regression input and response grids
 
@@ -291,7 +327,11 @@ The canonical hit input is:
 /metadata/line_pitch_mm            zero unless parallel_lines
 /metadata/line_count               zero unless parallel_lines
 /metadata/spacing_mm
+/metadata/fingerprint_sha256
+/metadata/effective_response_fingerprint_sha256
+/metadata/effective_response_sha256  optional full-file verification hash
 /metadata/source_angular_mode
+/metadata/source_backend
 /metadata/source_z_mm
 /metadata/source_thickness_mm      maximum line distance for line sources
 /metadata/source_transverse_count  transverse samples per line/x grid point
@@ -300,16 +340,30 @@ The canonical hit input is:
 /metadata/source_medium_z_max_mm
 /metadata/source_mu_order
 /metadata/source_phi_count
+/metadata/source_relative_tolerance
+/metadata/source_maximum_subdivision_depth
+/metadata/structured_disk_mu_order
+/metadata/structured_disk_phi_count
 ```
 
-Version-1 grid readers treat files without `domain_shape` as legacy disk
-grids. Rectangle grids persist their independent half-widths so continuous
-refinement clips candidates to the same source plane used by the coarse grid.
+The schema is `oos.response-grid.v2`. All metadata above except the optional
+full-file hash is required. The loader recomputes and verifies the grid's
+semantic fingerprint. Rectangle grids persist their independent half-widths
+so continuous refinement clips candidates to the same source plane used by
+the coarse grid.
 `parallel_lines` grids restrict the transverse coordinate to
 `line_y_start_mm + line_id * line_pitch_mm` and refine only the discrete line
 identifier plus the longitudinal coordinate. The source metadata records the
 near-line volume and angular quadrature used to marginalize the unobserved
 emission offset when each response-matrix row was built.
+
+Grid construction uses `--batch-size auto` by default. Auto mode requests
+four source candidates per OpenMP worker and caps the source/output working
+set at 512 MiB; an explicit positive integer retains the previous manual
+control. The effective-response semantic fingerprint is used for normal cache
+identity. `--verify-effective-content` additionally streams a SHA-256 over the
+complete effective-response file and stores it in the optional full-file hash
+field.
 
 The default Cartesian spacing is 10 mm and may be changed with
 `--spacing-mm`. `oos-regress fit --adjoint` additionally writes

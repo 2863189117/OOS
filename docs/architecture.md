@@ -66,6 +66,16 @@ logL[event,xy] = counts[event,channel] * logp[xy,channel]^T
 implemented with native cuBLAS. Without a grid, or after a grid supplies the
 global initial maximum, continuous candidates are rebuilt by the analytic
 shape-factor source integrator and evaluated through `effective.h5`.
+`SourceTraceRuntime` owns the reusable Embree scene, validated operator view,
+surface/plugin runtimes, domain-boundary candidates, and feature-edge cache.
+Clients construct it once and reuse it across source batches.
+The optional `structured_analytic` source backend is selected by geometry
+contracts rather than detector names. Declared direct/aperture elements avoid
+first-hit BVH queries, while a declared directional disk replaces an entire
+mapped validation fan with exact solid-angle coordinates. Recursive optical
+branches still use the normal surface models and may fall back to Embree at
+undeclared seams, so this is an alternate integration backend rather than a
+detector-specific physics implementation.
 
 Custom surfaces are explicitly divided into two contracts:
 

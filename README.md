@@ -5,9 +5,10 @@ multi-medium geometries. It reports absolute efficiency for sensitive
 channels and supports likelihood-based reconstruction from channel counts.
 
 The production runtime is C++17/OpenMP with an optional CUDA backend. Geometry
-uses Embree, persistent arrays use HDF5, and scenes use YAML. The installed
-command-line tools are `oos`, `oos-efficiency`, and
-`oos-regress`.
+uses Embree, persistent arrays use HDF5, and scenes use YAML. Structured
+analytic geometry can replace mesh-count-dependent source integration while
+retaining the same surface physics. The installed command-line tools are
+`oos`, `oos-efficiency`, and `oos-regress`.
 
 ## Repository boundary
 
@@ -70,6 +71,10 @@ basis adjoint propagation. Function plugins must export
 `oos_get_function_operator_v2` with paired linear forward and adjoint actions.
 V1 function plugins and `oos.effective-bounded-response.v1` files are not
 accepted.
+
+Version 0.2 writes `oos.effective-adjoint-response.v3` and
+`oos.response-grid.v2`. These files carry required semantic fingerprints;
+older response and grid schemas are intentionally rejected.
 
 See `docs/formats.md`, `docs/architecture.md`,
 `examples/dual-phase-tpc/README.md`, and `examples/pet-4x4/README.md`.

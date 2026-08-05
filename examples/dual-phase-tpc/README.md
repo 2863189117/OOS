@@ -18,7 +18,9 @@ TPC calculation:
 - deterministic Rayleigh first-flight and diffusion return in the liquid;
 - a factorized Fourier--Bessel response evaluated by an optional plugin;
 - quartz windows, sensitive photocathodes, and reflective boundaries;
-- analytic and triangle-derived surface-basis options.
+- analytic and triangle-derived surface-basis options;
+- an explicitly declared `structured_analytic` source backend for the gas
+  track, including exact directional-disk integration at the liquid surface.
 
 `generator/build_geometry.py` constructs the validation mesh and hexagonal PMT
 layout. `generator/build_analytic_geometry.py` adds an adaptive analytic
@@ -49,6 +51,22 @@ python3 examples/dual-phase-tpc/run_example.py \
   --output /tmp/oos-tpc-run \
   --geometry-profile smoke
 ```
+
+The runner always uses analytic geometry because the shipped source contract
+explicitly requires `structured_analytic`. Triangle-only geometry can still
+be generated separately for generic-BVH research comparisons.
+The `smoke` profile passes `--test` to the LXe generator. This reduces the
+liquid phase grid, collision sampling, and modal expansion while preserving
+the geometry-owned 40 x 80 liquid-surface egress basis. It therefore exercises
+generation, forward/adjoint plugin coupling, CUDA precompute, source injection,
+and HDF5 output without paying production precompute cost. The other profiles
+retain the production LXe defaults.
+
+An LXe block is keyed by the liquid radius, depth, and liquid-surface element
+contract rather than by the complete GXe geometry hash. Changing PMT or gas
+geometry therefore reuses the block when the liquid contract is unchanged.
+Both generated and externally supplied blocks are rejected if their liquid
+radius or depth disagrees with the selected detector geometry.
 
 The example can be copied outside the source tree after the binaries and
 plugin are built. It locates no core headers or source files at runtime.
