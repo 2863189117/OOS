@@ -785,6 +785,8 @@ EffectiveResponse build_effective_response_cuda(
     cusparseDestroy(sparse);
     throw;
   }
+  response.fingerprint_sha256 =
+      effective_response_fingerprint(response);
   response.validate();
   return response;
 }

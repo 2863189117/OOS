@@ -40,6 +40,42 @@ TEST_CASE("domain-aware intersection rejects nonadjacent geometry") {
   REQUIRE(filtered.distance == Catch::Approx(2.0).margin(1e-6));
 }
 
+TEST_CASE("packet intersection preserves scalar triangle results") {
+  oos::Scene scene;
+  scene.mesh.vertices = {
+      {-10, -10, 0}, {10, -10, 0}, {0, 10, 0}};
+  scene.mesh.triangles = {{0, 1, 2}};
+  scene.mesh.surface_id = {42};
+  scene.mesh.minus_domain_id = {0};
+  scene.mesh.plus_domain_id = {-1};
+  scene.mesh.channel_id = {-1};
+  oos::Geometry geometry(scene);
+  std::vector<oos::Ray> rays(17,
+      {{0, 0, 2}, {0, 0, -1}, 1.0e-9, 10.0});
+  const auto packet = geometry.intersect_batch(rays, 0);
+  REQUIRE(packet.size() == rays.size());
+  for (std::size_t index = 0; index < rays.size(); ++index) {
+    const auto scalar = geometry.intersect(rays[index], 0);
+    REQUIRE(packet[index].valid == scalar.valid);
+    CHECK(packet[index].geometry_key == scalar.geometry_key);
+    CHECK(packet[index].distance ==
+          Catch::Approx(scalar.distance).margin(1.0e-12));
+  }
+  const std::vector<std::int32_t> domains(rays.size(), 0);
+  const auto mixed = geometry.intersect_batch(rays, domains);
+  REQUIRE(mixed.size() == packet.size());
+  for (std::size_t index = 0; index < mixed.size(); ++index)
+    CHECK(mixed[index].geometry_key == packet[index].geometry_key);
+  for (std::size_t index = 0; index < 8; ++index)
+    rays[index].direction =
+        index % 2 == 0 ? oos::Vec3{0, 0, -1}
+                       : oos::Vec3{1, 0, -1};
+  const auto divergent = geometry.intersect_batch(rays, 0);
+  for (std::size_t index = 0; index < rays.size(); ++index)
+    CHECK(divergent[index].valid ==
+          geometry.intersect(rays[index], 0).valid);
+}
+
 namespace {
 oos::Scene analytic_test_scene() {
   oos::Scene scene;
@@ -82,6 +118,16 @@ TEST_CASE("analytic disk and perforated disk use exact circular boundaries") {
       geometry.intersect({{2.0, 0, 2}, {0, 0, -1}}, 0).valid);
   REQUIRE_FALSE(
       geometry.intersect({{5.01, 0, 2}, {0, 0, -1}}, 0).valid);
+
+  std::vector<oos::Ray> rays(8,
+      {{0, 0, 2}, {0, 0, -1}, 1.0e-9, 10.0});
+  const auto packet = geometry.intersect_batch(rays, 0);
+  for (const auto& packet_hit : packet) {
+    REQUIRE(packet_hit.valid);
+    CHECK(packet_hit.geometry_key == center.geometry_key);
+    CHECK(packet_hit.distance ==
+          Catch::Approx(center.distance).margin(1.0e-12));
+  }
 }
 
 TEST_CASE("analytic finite cylinder returns its exact curved normal") {

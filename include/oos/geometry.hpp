@@ -21,6 +21,22 @@ class Geometry {
 
   Hit intersect(const Ray& ray) const;
   Hit intersect(const Ray& ray, std::int32_t domain) const;
+  // Intersect a coherent stream of rays that all originate in one domain.
+  // Embree can vectorize/traverse this stream more efficiently than repeated
+  // rtcIntersect1 calls. Results preserve input order.
+  std::vector<Hit> intersect_batch(
+      const std::vector<Ray>& rays, std::int32_t domain) const;
+  // Mixed-domain convenience path. Rays are grouped by domain internally and
+  // restored to caller order.
+  std::vector<Hit> intersect_batch(
+      const std::vector<Ray>& rays,
+      const std::vector<std::int32_t>& domains) const;
+  // Exact O(1) intersection against one declared analytic primitive. Used by
+  // structured source integration after the geometry file has certified that
+  // this primitive owns the first hit.
+  std::optional<Hit> intersect_declared_analytic(
+      std::uint32_t primitive_index, const Ray& ray,
+      std::int32_t domain) const;
   bool has_nonadjacent_self_intersection() const;
   double ray_origin_offset_mm() const { return ray_origin_offset_mm_; }
 
@@ -42,6 +58,8 @@ class Geometry {
       std::uint32_t primitive_index,
       const std::array<double, 3>& coordinates,
       const Vec3& normal) const;
+  Hit decode_intersection(const Ray& ray, std::int32_t domain,
+                          const RTCRayHit& query) const;
 
   const Scene* scene_{};
   RTCDevice device_{};

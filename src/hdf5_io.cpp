@@ -158,32 +158,22 @@ MeshData load_geometry_hdf5(const std::filesystem::path& path) {
   }
   mesh.surface_id =
       read_dataset<std::uint32_t>(file, "/geometry/surface_id").first;
-  if (exists(file, "/geometry/surface_basis_id")) {
-    mesh.surface_basis_id =
-        read_dataset<std::uint32_t>(file, "/geometry/surface_basis_id").first;
-  } else {
-    mesh.surface_basis_id.resize(mesh.triangles.size());
-    std::iota(mesh.surface_basis_id.begin(), mesh.surface_basis_id.end(), 0u);
-  }
+  mesh.surface_basis_id =
+      read_dataset<std::uint32_t>(file, "/geometry/surface_basis_id").first;
   mesh.minus_domain_id =
       read_dataset<std::int32_t>(file, "/geometry/minus_domain_id").first;
   mesh.plus_domain_id =
       read_dataset<std::int32_t>(file, "/geometry/plus_domain_id").first;
   mesh.channel_id =
       read_dataset<std::int32_t>(file, "/geometry/channel_id").first;
-  if (exists(file, "/geometry/triangle_transport")) {
-    mesh.triangle_transport =
-        read_dataset<std::uint8_t>(file, "/geometry/triangle_transport").first;
-  } else {
-    mesh.triangle_transport.assign(mesh.triangles.size(), 1u);
-  }
-  if (exists(file, "/geometry/triangle_source_quadrature")) {
-    mesh.triangle_source_quadrature =
-        read_dataset<std::uint8_t>(
-            file, "/geometry/triangle_source_quadrature").first;
-  } else {
-    mesh.triangle_source_quadrature = mesh.triangle_transport;
-  }
+  mesh.triangle_transport =
+      read_dataset<std::uint8_t>(file, "/geometry/triangle_transport").first;
+  mesh.triangle_source_quadrature =
+      read_dataset<std::uint8_t>(
+          file, "/geometry/triangle_source_quadrature").first;
+  mesh.triangle_source_analytic_primitive =
+      read_dataset<std::uint32_t>(
+          file, "/geometry/triangle_source_analytic_primitive").first;
   if (exists(file, "/analytic/kind")) {
     auto [kind, kind_dims] =
         read_dataset<std::uint8_t>(file, "/analytic/kind");
@@ -215,6 +205,9 @@ MeshData load_geometry_hdf5(const std::filesystem::path& path) {
     const auto surface_element =
         read_dataset<std::uint64_t>(
             file, "/analytic/surface_element").first;
+    const auto source_integral =
+        read_dataset<std::uint8_t>(
+            file, "/analytic/source_integral").first;
     const auto hole_offset =
         read_dataset<std::uint64_t>(
             file, "/analytic/hole_offset").first;
@@ -239,6 +232,7 @@ MeshData load_geometry_hdf5(const std::filesystem::path& path) {
         !vector_count_ok(plus_domain_id.size()) ||
         !vector_count_ok(channel_id.size()) ||
         !vector_count_ok(surface_element.size()) ||
+        !vector_count_ok(source_integral.size()) ||
         hole_offset.size() != count + 1 ||
         hole_center_dims != std::vector<hsize_t>{hole_radius.size(), 2} ||
         hole_offset.front() != 0 ||
@@ -272,6 +266,12 @@ MeshData load_geometry_hdf5(const std::filesystem::path& path) {
       primitive.plus_domain_id = plus_domain_id[i];
       primitive.channel_id = channel_id[i];
       primitive.surface_element = surface_element[i];
+      if (source_integral[i] > static_cast<std::uint8_t>(
+                                   AnalyticSourceIntegral::directional_disk))
+        throw std::runtime_error(
+            "analytic primitive has an unknown source integral");
+      primitive.source_integral =
+          static_cast<AnalyticSourceIntegral>(source_integral[i]);
       for (std::uint64_t hole = hole_offset[i];
            hole < hole_offset[i + 1]; ++hole)
         primitive.holes.push_back(
@@ -301,30 +301,21 @@ MeshData load_geometry_hdf5(const std::filesystem::path& path) {
         read_dataset<std::uint64_t>(
             file, "/analytic/elements/surface_element").first;
     const std::size_t count = primitive_index.size();
-    std::vector<std::uint8_t> source_quadrature(count, 1u);
-    if (exists(file, "/analytic/elements/source_quadrature"))
-      source_quadrature =
-          read_dataset<std::uint8_t>(
-              file, "/analytic/elements/source_quadrature").first;
-    std::vector<std::uint32_t> aperture_primitive(
-        count, std::numeric_limits<std::uint32_t>::max());
-    std::vector<std::uint32_t> aperture_hole(
-        count, std::numeric_limits<std::uint32_t>::max());
-    if (exists(
+    const auto source_quadrature =
+        read_dataset<std::uint8_t>(
+            file, "/analytic/elements/source_quadrature").first;
+    const auto source_visibility =
+        read_dataset<std::uint8_t>(
+            file, "/analytic/elements/source_visibility").first;
+    const auto aperture_primitive =
+        read_dataset<std::uint32_t>(
             file,
-            "/analytic/elements/projected_aperture_primitive_index"))
-      aperture_primitive =
-          read_dataset<std::uint32_t>(
-              file,
-              "/analytic/elements/projected_aperture_primitive_index")
-              .first;
-    if (exists(file,
-               "/analytic/elements/projected_aperture_hole_index"))
-      aperture_hole =
-          read_dataset<std::uint32_t>(
-              file,
-              "/analytic/elements/projected_aperture_hole_index")
-              .first;
+            "/analytic/elements/projected_aperture_primitive_index")
+            .first;
+    const auto aperture_hole =
+        read_dataset<std::uint32_t>(
+            file, "/analytic/elements/projected_aperture_hole_index")
+            .first;
     if (coordinates.size() != count ||
         bounds_dims != std::vector<hsize_t>{count, 5} ||
         center_dims != std::vector<hsize_t>{count, 3} ||
@@ -332,6 +323,7 @@ MeshData load_geometry_hdf5(const std::filesystem::path& path) {
         area.size() != count || basis.size() != count ||
         surface_element.size() != count ||
         source_quadrature.size() != count ||
+        source_visibility.size() != count ||
         aperture_primitive.size() != count ||
         aperture_hole.size() != count)
       throw std::runtime_error(
@@ -356,6 +348,12 @@ MeshData load_geometry_hdf5(const std::filesystem::path& path) {
       element.surface_basis_id = basis[i];
       element.surface_element = surface_element[i];
       element.source_quadrature = source_quadrature[i] != 0;
+      if (source_visibility[i] > static_cast<std::uint8_t>(
+                                     AnalyticSourceVisibility::projected_aperture))
+        throw std::runtime_error(
+            "analytic surface element has unknown source visibility");
+      element.source_visibility =
+          static_cast<AnalyticSourceVisibility>(source_visibility[i]);
       element.projected_aperture_primitive_index =
           aperture_primitive[i];
       element.projected_aperture_hole_index = aperture_hole[i];
@@ -394,7 +392,9 @@ void save_geometry_hdf5(const std::filesystem::path& path,
       (!mesh.triangle_transport.empty() &&
        mesh.triangle_transport.size() != triangle_count) ||
       (!mesh.triangle_source_quadrature.empty() &&
-       mesh.triangle_source_quadrature.size() != triangle_count))
+       mesh.triangle_source_quadrature.size() != triangle_count) ||
+      (!mesh.triangle_source_analytic_primitive.empty() &&
+       mesh.triangle_source_analytic_primitive.size() != triangle_count))
     throw std::runtime_error("geometry arrays do not share triangle length");
   H5Handle file(H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT),
                 H5Fclose);
@@ -440,11 +440,19 @@ void save_geometry_hdf5(const std::filesystem::path& path,
           : mesh.triangle_source_quadrature;
   write_dataset(file, "/geometry/triangle_source_quadrature",
                 triangle_source_quadrature, {triangle_count});
+  const std::vector<std::uint32_t> triangle_source_analytic_primitive =
+      mesh.triangle_source_analytic_primitive.empty()
+          ? std::vector<std::uint32_t>(
+                triangle_count, std::numeric_limits<std::uint32_t>::max())
+          : mesh.triangle_source_analytic_primitive;
+  write_dataset(file, "/geometry/triangle_source_analytic_primitive",
+                triangle_source_analytic_primitive, {triangle_count});
   if (!mesh.analytic_primitives.empty()) {
     create_group(file, "/analytic");
     std::vector<std::uint8_t> kind;
     std::vector<double> center, axis_x, axis_y, axis_z, parameters;
     std::vector<double> normal_sign;
+    std::vector<std::uint8_t> source_integral;
     std::vector<std::uint32_t> surface_id, surface_basis_id;
     std::vector<std::int32_t> minus_domain_id, plus_domain_id, channel_id;
     std::vector<std::uint64_t> surface_element, hole_offset{0};
@@ -466,6 +474,8 @@ void save_geometry_hdf5(const std::filesystem::path& path,
       parameters.insert(parameters.end(), primitive.parameters.begin(),
                         primitive.parameters.end());
       normal_sign.push_back(primitive.normal_sign);
+      source_integral.push_back(
+          static_cast<std::uint8_t>(primitive.source_integral));
       surface_id.push_back(primitive.surface_id);
       surface_basis_id.push_back(primitive.surface_basis_id);
       minus_domain_id.push_back(primitive.minus_domain_id);
@@ -488,6 +498,8 @@ void save_geometry_hdf5(const std::filesystem::path& path,
     write_dataset(file, "/analytic/axis_z", axis_z, {count, 3});
     write_dataset(file, "/analytic/parameters", parameters, {count, 4});
     write_dataset(file, "/analytic/normal_sign", normal_sign, {count});
+    write_dataset(file, "/analytic/source_integral", source_integral,
+                  {count});
     write_dataset(file, "/analytic/surface_id", surface_id, {count});
     write_dataset(file, "/analytic/surface_basis_id", surface_basis_id,
                   {count});
@@ -510,7 +522,8 @@ void save_geometry_hdf5(const std::filesystem::path& path,
     create_group(file, "/analytic/elements");
     std::vector<std::uint32_t> primitive_index, surface_basis_id;
     std::vector<std::uint32_t> aperture_primitive, aperture_hole;
-    std::vector<std::uint8_t> coordinates, source_quadrature;
+    std::vector<std::uint8_t> coordinates, source_quadrature,
+        source_visibility;
     std::vector<double> bounds, center, normal, area;
     std::vector<std::uint64_t> surface_element;
     const auto count = mesh.analytic_surface_elements.size();
@@ -532,6 +545,8 @@ void save_geometry_hdf5(const std::filesystem::path& path,
       surface_basis_id.push_back(element.surface_basis_id);
       surface_element.push_back(element.surface_element);
       source_quadrature.push_back(element.source_quadrature ? 1u : 0u);
+      source_visibility.push_back(
+          static_cast<std::uint8_t>(element.source_visibility));
       aperture_primitive.push_back(
           element.projected_aperture_primitive_index);
       aperture_hole.push_back(element.projected_aperture_hole_index);
@@ -550,6 +565,8 @@ void save_geometry_hdf5(const std::filesystem::path& path,
                   surface_element, {count});
     write_dataset(file, "/analytic/elements/source_quadrature",
                   source_quadrature, {count});
+    write_dataset(file, "/analytic/elements/source_visibility",
+                  source_visibility, {count});
     write_dataset(
         file,
         "/analytic/elements/projected_aperture_primitive_index",
@@ -808,7 +825,7 @@ void save_effective_response_hdf5(const std::filesystem::path& path,
                 {response.channels});
   create_group(file, "/metadata");
   write_string(file, "/metadata/schema",
-               "oos.effective-adjoint-response.v2");
+               "oos.effective-adjoint-response.v3");
   write_string(file, "/metadata/construction_method",
                response.construction_method);
   write_dataset(file, "/metadata/cycles",
@@ -819,6 +836,8 @@ void save_effective_response_hdf5(const std::filesystem::path& path,
                 std::vector<double>{response.operator_tolerance}, {1});
   write_string(file, "/metadata/operator_cache_key_sha256",
                response.operator_cache_key_sha256);
+  write_string(file, "/metadata/fingerprint_sha256",
+               effective_response_fingerprint(response));
   write_string(file, "/metadata/code_commit", response.code_commit);
   write_string(file, "/metadata/loss_names_json",
                nlohmann::json(response.loss_names).dump());
@@ -828,7 +847,7 @@ EffectiveResponse load_effective_response_hdf5(
     const std::filesystem::path& path) {
   H5Handle file(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
   if (read_string(file, "/metadata/schema") !=
-      "oos.effective-adjoint-response.v2")
+      "oos.effective-adjoint-response.v3")
     throw std::runtime_error("unsupported effective response schema");
   EffectiveResponse response;
   auto [detection, detection_dims] =
@@ -861,10 +880,16 @@ EffectiveResponse load_effective_response_hdf5(
       read_string(file, "/metadata/construction_method");
   response.operator_cache_key_sha256 =
       read_string(file, "/metadata/operator_cache_key_sha256");
+  response.fingerprint_sha256 =
+      read_string(file, "/metadata/fingerprint_sha256");
   response.code_commit = read_string(file, "/metadata/code_commit");
   response.loss_names =
       nlohmann::json::parse(read_string(file, "/metadata/loss_names_json"))
           .get<std::vector<std::string>>();
+  if (response.fingerprint_sha256 !=
+      effective_response_fingerprint(response))
+    throw std::runtime_error(
+        "effective response semantic fingerprint does not match metadata");
   response.validate();
   return response;
 }
@@ -897,6 +922,15 @@ HitBatch load_hit_batch_hdf5(const std::filesystem::path& path) {
 void save_response_grid_hdf5(const std::filesystem::path& path,
                              const ResponseGrid& grid) {
   grid.validate();
+  if (grid.effective_response_fingerprint_sha256.empty() ||
+      grid.source_angular_mode.empty())
+    throw std::runtime_error(
+        "response grid lacks required source provenance");
+  const auto fingerprint = response_grid_fingerprint(grid);
+  if (!grid.fingerprint_sha256.empty() &&
+      grid.fingerprint_sha256 != fingerprint)
+    throw std::runtime_error(
+        "response-grid semantic fingerprint is stale");
   H5Handle file(H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT),
                 H5Fclose);
   create_group(file, "/grid");
@@ -909,7 +943,9 @@ void save_response_grid_hdf5(const std::filesystem::path& path,
   write_dataset(file, "/grid/channel_id", grid.channel_ids,
                 {grid.channels});
   create_group(file, "/metadata");
-  write_string(file, "/metadata/schema", "oos.response-grid.v1");
+  write_string(file, "/metadata/schema", "oos.response-grid.v2");
+  write_string(file, "/metadata/fingerprint_sha256",
+               fingerprint);
   write_string(file, "/metadata/domain_shape", grid.domain_shape);
   write_dataset(file, "/metadata/radius_mm",
                 std::vector<double>{grid.radius_mm}, {1});
@@ -925,10 +961,14 @@ void save_response_grid_hdf5(const std::filesystem::path& path,
                 std::vector<std::uint64_t>{grid.line_count}, {1});
   write_dataset(file, "/metadata/spacing_mm",
                 std::vector<double>{grid.spacing_mm}, {1});
-  write_string(file, "/metadata/effective_response_sha256",
-               grid.effective_response_sha256);
+  if (!grid.effective_response_sha256.empty())
+    write_string(file, "/metadata/effective_response_sha256",
+                 grid.effective_response_sha256);
+  write_string(file, "/metadata/effective_response_fingerprint_sha256",
+               grid.effective_response_fingerprint_sha256);
   write_string(file, "/metadata/source_angular_mode",
                grid.source_angular_mode);
+  write_string(file, "/metadata/source_backend", grid.source_backend);
   write_dataset(file, "/metadata/source_z_mm",
                 std::vector<double>{grid.source_z_mm}, {1});
   write_dataset(file, "/metadata/source_thickness_mm",
@@ -946,13 +986,26 @@ void save_response_grid_hdf5(const std::filesystem::path& path,
                 std::vector<std::uint32_t>{grid.source_mu_order}, {1});
   write_dataset(file, "/metadata/source_phi_count",
                 std::vector<std::uint32_t>{grid.source_phi_count}, {1});
+  write_dataset(file, "/metadata/source_relative_tolerance",
+                std::vector<double>{grid.source_relative_tolerance}, {1});
+  write_dataset(
+      file, "/metadata/source_maximum_subdivision_depth",
+      std::vector<std::uint32_t>{grid.source_maximum_subdivision_depth}, {1});
+  write_dataset(file, "/metadata/structured_disk_mu_order",
+                std::vector<std::uint32_t>{grid.structured_disk_mu_order},
+                {1});
+  write_dataset(file, "/metadata/structured_disk_phi_count",
+                std::vector<std::uint32_t>{grid.structured_disk_phi_count},
+                {1});
 }
 
 ResponseGrid load_response_grid_hdf5(const std::filesystem::path& path) {
   H5Handle file(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
-  if (read_string(file, "/metadata/schema") != "oos.response-grid.v1")
+  if (read_string(file, "/metadata/schema") != "oos.response-grid.v2")
     throw std::runtime_error("unsupported response-grid schema");
   ResponseGrid grid;
+  grid.fingerprint_sha256 =
+      read_string(file, "/metadata/fingerprint_sha256");
   auto [xy, xy_dims] = read_dataset<double>(file, "/grid/xy_mm");
   auto [log_probability, probability_dims] =
       read_dataset<float>(file, "/grid/conditional_log_probability");
@@ -992,43 +1045,53 @@ ResponseGrid load_response_grid_hdf5(const std::filesystem::path& path) {
         read_dataset<std::uint64_t>(file, "/metadata/line_count").first.at(0);
   grid.spacing_mm =
       read_dataset<double>(file, "/metadata/spacing_mm").first.at(0);
-  grid.effective_response_sha256 =
-      read_string(file, "/metadata/effective_response_sha256");
-  if (exists(file, "/metadata/source_angular_mode"))
-    grid.source_angular_mode =
-        read_string(file, "/metadata/source_angular_mode");
-  if (exists(file, "/metadata/source_z_mm"))
-    grid.source_z_mm =
-        read_dataset<double>(file, "/metadata/source_z_mm").first.at(0);
-  if (exists(file, "/metadata/source_thickness_mm"))
-    grid.source_thickness_mm =
-        read_dataset<double>(file, "/metadata/source_thickness_mm")
-            .first.at(0);
-  if (exists(file, "/metadata/source_transverse_count"))
-    grid.source_transverse_count =
-        read_dataset<std::uint32_t>(
-            file, "/metadata/source_transverse_count").first.at(0);
-  if (exists(file, "/metadata/obstacle_half_width_mm"))
-    grid.obstacle_half_width_mm =
-        read_dataset<double>(file, "/metadata/obstacle_half_width_mm")
-            .first.at(0);
-  if (exists(file, "/metadata/obstacle_half_thickness_mm"))
-    grid.obstacle_half_thickness_mm =
-        read_dataset<double>(file, "/metadata/obstacle_half_thickness_mm")
-            .first.at(0);
-  if (exists(file, "/metadata/source_medium_z_max_mm"))
-    grid.source_medium_z_max_mm =
-        read_dataset<double>(file, "/metadata/source_medium_z_max_mm")
-            .first.at(0);
-  if (exists(file, "/metadata/source_mu_order"))
-    grid.source_mu_order =
-        read_dataset<std::uint32_t>(
-            file, "/metadata/source_mu_order").first.at(0);
-  if (exists(file, "/metadata/source_phi_count"))
-    grid.source_phi_count =
-        read_dataset<std::uint32_t>(
-            file, "/metadata/source_phi_count").first.at(0);
+  if (exists(file, "/metadata/effective_response_sha256"))
+    grid.effective_response_sha256 =
+        read_string(file, "/metadata/effective_response_sha256");
+  grid.effective_response_fingerprint_sha256 = read_string(
+      file, "/metadata/effective_response_fingerprint_sha256");
+  grid.source_angular_mode =
+      read_string(file, "/metadata/source_angular_mode");
+  grid.source_backend = read_string(file, "/metadata/source_backend");
+  grid.source_z_mm =
+      read_dataset<double>(file, "/metadata/source_z_mm").first.at(0);
+  grid.source_thickness_mm =
+      read_dataset<double>(file, "/metadata/source_thickness_mm")
+          .first.at(0);
+  grid.source_transverse_count =
+      read_dataset<std::uint32_t>(
+          file, "/metadata/source_transverse_count").first.at(0);
+  grid.obstacle_half_width_mm =
+      read_dataset<double>(file, "/metadata/obstacle_half_width_mm")
+          .first.at(0);
+  grid.obstacle_half_thickness_mm =
+      read_dataset<double>(file, "/metadata/obstacle_half_thickness_mm")
+          .first.at(0);
+  grid.source_medium_z_max_mm =
+      read_dataset<double>(file, "/metadata/source_medium_z_max_mm")
+          .first.at(0);
+  grid.source_mu_order =
+      read_dataset<std::uint32_t>(
+          file, "/metadata/source_mu_order").first.at(0);
+  grid.source_phi_count =
+      read_dataset<std::uint32_t>(
+          file, "/metadata/source_phi_count").first.at(0);
+  grid.source_relative_tolerance =
+      read_dataset<double>(
+          file, "/metadata/source_relative_tolerance").first.at(0);
+  grid.source_maximum_subdivision_depth =
+      read_dataset<std::uint32_t>(
+          file, "/metadata/source_maximum_subdivision_depth").first.at(0);
+  grid.structured_disk_mu_order =
+      read_dataset<std::uint32_t>(
+          file, "/metadata/structured_disk_mu_order").first.at(0);
+  grid.structured_disk_phi_count =
+      read_dataset<std::uint32_t>(
+          file, "/metadata/structured_disk_phi_count").first.at(0);
   grid.validate();
+  if (grid.fingerprint_sha256 != response_grid_fingerprint(grid))
+    throw std::runtime_error(
+        "response-grid semantic fingerprint does not match metadata");
   return grid;
 }
 

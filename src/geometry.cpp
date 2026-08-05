@@ -93,22 +93,67 @@ struct DomainQueryContext {
   std::int32_t domain{std::numeric_limits<std::int32_t>::min()};
 };
 
+RTCRayHit make_query(const Ray& ray) {
+  const Vec3 direction = normalized(ray.direction);
+  RTCRayHit query{};
+  query.ray.org_x = static_cast<float>(ray.origin.x);
+  query.ray.org_y = static_cast<float>(ray.origin.y);
+  query.ray.org_z = static_cast<float>(ray.origin.z);
+  query.ray.dir_x = static_cast<float>(direction.x);
+  query.ray.dir_y = static_cast<float>(direction.y);
+  query.ray.dir_z = static_cast<float>(direction.z);
+  query.ray.tnear = static_cast<float>(ray.t_min);
+  query.ray.tfar = static_cast<float>(ray.t_max);
+  query.ray.mask = 0xffffffffu;
+  query.ray.flags = 0;
+  query.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+  query.hit.primID = RTC_INVALID_GEOMETRY_ID;
+  return query;
+}
+
 void adjacent_domain_filter(const RTCFilterFunctionNArguments* arguments) {
-  if (arguments->N != 1 || !arguments->valid[0]) return;
   const auto* context =
       reinterpret_cast<const DomainQueryContext*>(arguments->context);
-  const auto* hit = reinterpret_cast<const RTCHit*>(arguments->hit);
-  const auto primitive = hit->primID;
-  if (!context->scene->mesh.triangle_transport.empty() &&
-      !context->scene->mesh.triangle_transport.at(primitive)) {
-    arguments->valid[0] = 0;
+  if (arguments->N == 1) {
+    if (!arguments->valid[0]) return;
+    const auto* hit = reinterpret_cast<const RTCHit*>(arguments->hit);
+    const auto primitive = hit->primID;
+    if (!context->scene->mesh.triangle_transport.empty() &&
+        !context->scene->mesh.triangle_transport.at(primitive)) {
+      arguments->valid[0] = 0;
+      return;
+    }
+    if (context->domain ==
+        std::numeric_limits<std::int32_t>::min())
+      return;
+    const auto minus =
+        context->scene->mesh.minus_domain_id.at(primitive);
+    const auto plus =
+        context->scene->mesh.plus_domain_id.at(primitive);
+    if (context->domain != minus && context->domain != plus)
+      arguments->valid[0] = 0;
     return;
   }
-  if (context->domain == std::numeric_limits<std::int32_t>::min()) return;
-  const auto minus = context->scene->mesh.minus_domain_id.at(primitive);
-  const auto plus = context->scene->mesh.plus_domain_id.at(primitive);
-  if (context->domain != minus && context->domain != plus)
-    arguments->valid[0] = 0;
+  auto* hit = reinterpret_cast<RTCHitN*>(arguments->hit);
+  for (unsigned int lane = 0; lane < arguments->N; ++lane) {
+    if (!arguments->valid[lane]) continue;
+    const auto primitive =
+        RTCHitN_primID(hit, arguments->N, lane);
+    if (!context->scene->mesh.triangle_transport.empty() &&
+        !context->scene->mesh.triangle_transport.at(primitive)) {
+      arguments->valid[lane] = 0;
+      continue;
+    }
+    if (context->domain ==
+        std::numeric_limits<std::int32_t>::min())
+      continue;
+    const auto minus =
+        context->scene->mesh.minus_domain_id.at(primitive);
+    const auto plus =
+        context->scene->mesh.plus_domain_id.at(primitive);
+    if (context->domain != minus && context->domain != plus)
+      arguments->valid[lane] = 0;
+  }
 }
 
 void analytic_bounds(const RTCBoundsFunctionArguments* arguments) {
@@ -177,30 +222,71 @@ void analytic_bounds(const RTCBoundsFunctionArguments* arguments) {
 
 void analytic_intersect(
     const RTCIntersectFunctionNArguments* arguments) {
-  if (arguments->N != 1 || !arguments->valid[0]) return;
   const auto* scene = static_cast<const Scene*>(arguments->geometryUserPtr);
   const auto* context =
       reinterpret_cast<const DomainQueryContext*>(arguments->context);
-  auto* ray_hit = reinterpret_cast<RTCRayHit*>(arguments->rayhit);
-  const Ray ray{{ray_hit->ray.org_x, ray_hit->ray.org_y,
-                 ray_hit->ray.org_z},
-                {ray_hit->ray.dir_x, ray_hit->ray.dir_y,
-                 ray_hit->ray.dir_z},
-                ray_hit->ray.tnear, ray_hit->ray.tfar};
-  const auto candidate = intersect_analytic_primitive(
-      scene->mesh.analytic_primitives.at(arguments->primID),
-      arguments->primID, ray, context->domain);
-  if (!candidate) return;
-  ray_hit->ray.tfar = static_cast<float>(candidate->distance);
-  ray_hit->hit.geomID = arguments->geomID;
-  ray_hit->hit.primID = arguments->primID;
-  ray_hit->hit.u = 0.0f;
-  ray_hit->hit.v = 0.0f;
-  ray_hit->hit.Ng_x = static_cast<float>(candidate->normal.x);
-  ray_hit->hit.Ng_y = static_cast<float>(candidate->normal.y);
-  ray_hit->hit.Ng_z = static_cast<float>(candidate->normal.z);
-  for (unsigned level = 0; level < RTC_MAX_INSTANCE_LEVEL_COUNT; ++level)
-    ray_hit->hit.instID[level] = context->context.instID[level];
+  if (arguments->N == 1) {
+    if (!arguments->valid[0]) return;
+    auto* ray_hit = reinterpret_cast<RTCRayHit*>(arguments->rayhit);
+    const Ray ray{{ray_hit->ray.org_x, ray_hit->ray.org_y,
+                   ray_hit->ray.org_z},
+                  {ray_hit->ray.dir_x, ray_hit->ray.dir_y,
+                   ray_hit->ray.dir_z},
+                  ray_hit->ray.tnear, ray_hit->ray.tfar};
+    const auto candidate = intersect_analytic_primitive(
+        scene->mesh.analytic_primitives.at(arguments->primID),
+        arguments->primID, ray, context->domain);
+    if (!candidate) return;
+    ray_hit->ray.tfar = static_cast<float>(candidate->distance);
+    ray_hit->hit.geomID = arguments->geomID;
+    ray_hit->hit.primID = arguments->primID;
+    ray_hit->hit.u = 0.0f;
+    ray_hit->hit.v = 0.0f;
+    ray_hit->hit.Ng_x = static_cast<float>(candidate->normal.x);
+    ray_hit->hit.Ng_y = static_cast<float>(candidate->normal.y);
+    ray_hit->hit.Ng_z = static_cast<float>(candidate->normal.z);
+    for (unsigned level = 0;
+         level < RTC_MAX_INSTANCE_LEVEL_COUNT; ++level)
+      ray_hit->hit.instID[level] = context->context.instID[level];
+    return;
+  }
+  auto* ray_hit = reinterpret_cast<RTCRayHitN*>(arguments->rayhit);
+  auto* embree_ray = RTCRayHitN_RayN(ray_hit, arguments->N);
+  auto* embree_hit = RTCRayHitN_HitN(ray_hit, arguments->N);
+  for (unsigned int lane = 0; lane < arguments->N; ++lane) {
+    if (!arguments->valid[lane]) continue;
+    const Ray ray{
+        {RTCRayN_org_x(embree_ray, arguments->N, lane),
+         RTCRayN_org_y(embree_ray, arguments->N, lane),
+         RTCRayN_org_z(embree_ray, arguments->N, lane)},
+        {RTCRayN_dir_x(embree_ray, arguments->N, lane),
+         RTCRayN_dir_y(embree_ray, arguments->N, lane),
+         RTCRayN_dir_z(embree_ray, arguments->N, lane)},
+        RTCRayN_tnear(embree_ray, arguments->N, lane),
+        RTCRayN_tfar(embree_ray, arguments->N, lane)};
+    const auto candidate = intersect_analytic_primitive(
+        scene->mesh.analytic_primitives.at(arguments->primID),
+        arguments->primID, ray, context->domain);
+    if (!candidate) continue;
+    RTCRayN_tfar(embree_ray, arguments->N, lane) =
+        static_cast<float>(candidate->distance);
+    RTCHitN_geomID(embree_hit, arguments->N, lane) =
+        arguments->geomID;
+    RTCHitN_primID(embree_hit, arguments->N, lane) =
+        arguments->primID;
+    RTCHitN_u(embree_hit, arguments->N, lane) = 0.0f;
+    RTCHitN_v(embree_hit, arguments->N, lane) = 0.0f;
+    RTCHitN_Ng_x(embree_hit, arguments->N, lane) =
+        static_cast<float>(candidate->normal.x);
+    RTCHitN_Ng_y(embree_hit, arguments->N, lane) =
+        static_cast<float>(candidate->normal.y);
+    RTCHitN_Ng_z(embree_hit, arguments->N, lane) =
+        static_cast<float>(candidate->normal.z);
+    for (unsigned level = 0;
+         level < RTC_MAX_INSTANCE_LEVEL_COUNT; ++level)
+      RTCHitN_instID(embree_hit, arguments->N, lane, level) =
+          context->context.instID[level];
+  }
 }
 }  // namespace
 
@@ -404,20 +490,7 @@ Hit Geometry::intersect(const Ray& ray) const {
 }
 
 Hit Geometry::intersect(const Ray& ray, std::int32_t domain) const {
-  const Vec3 direction = normalized(ray.direction);
-  RTCRayHit query{};
-  query.ray.org_x = static_cast<float>(ray.origin.x);
-  query.ray.org_y = static_cast<float>(ray.origin.y);
-  query.ray.org_z = static_cast<float>(ray.origin.z);
-  query.ray.dir_x = static_cast<float>(direction.x);
-  query.ray.dir_y = static_cast<float>(direction.y);
-  query.ray.dir_z = static_cast<float>(direction.z);
-  query.ray.tnear = static_cast<float>(ray.t_min);
-  query.ray.tfar = static_cast<float>(ray.t_max);
-  query.ray.mask = 0xffffffffu;
-  query.ray.flags = 0;
-  query.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-  query.hit.primID = RTC_INVALID_GEOMETRY_ID;
+  RTCRayHit query = make_query(ray);
   RTCIntersectArguments arguments;
   rtcInitIntersectArguments(&arguments);
   DomainQueryContext context{};
@@ -430,6 +503,155 @@ Hit Geometry::intersect(const Ray& ray, std::int32_t domain) const {
       RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER |
       RTC_RAY_QUERY_FLAG_INCOHERENT);
   rtcIntersect1(scene_handle_, &query, &arguments);
+  return decode_intersection(ray, domain, query);
+}
+
+std::vector<Hit> Geometry::intersect_batch(
+    const std::vector<Ray>& rays, std::int32_t domain) const {
+  if (rays.empty()) return {};
+  RTCIntersectArguments arguments;
+  rtcInitIntersectArguments(&arguments);
+  DomainQueryContext context{};
+  rtcInitRayQueryContext(&context.context);
+  context.scene = scene_;
+  context.domain = domain;
+  arguments.context = &context.context;
+  arguments.filter = adjacent_domain_filter;
+  arguments.flags = static_cast<RTCRayQueryFlags>(
+      RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER |
+      RTC_RAY_QUERY_FLAG_INCOHERENT);
+  std::vector<Hit> result(rays.size());
+  constexpr std::size_t width = 8;
+  std::size_t begin = 0;
+  for (; begin + width <= rays.size(); begin += width) {
+    const Vec3 reference = normalized(rays[begin].direction);
+    bool coherent = true;
+    for (std::size_t lane = 1; lane < width; ++lane)
+      if (dot(reference,
+              normalized(rays[begin + lane].direction)) < 0.9) {
+        coherent = false;
+        break;
+      }
+    if (!coherent) {
+      for (std::size_t lane = 0; lane < width; ++lane)
+        result[begin + lane] =
+            intersect(rays[begin + lane], domain);
+      continue;
+    }
+    alignas(32) RTCRayHit8 packet{};
+    alignas(32) int valid[width];
+    for (std::size_t lane = 0; lane < width; ++lane) {
+      const auto query = make_query(rays[begin + lane]);
+      valid[lane] = -1;
+      packet.ray.org_x[lane] = query.ray.org_x;
+      packet.ray.org_y[lane] = query.ray.org_y;
+      packet.ray.org_z[lane] = query.ray.org_z;
+      packet.ray.dir_x[lane] = query.ray.dir_x;
+      packet.ray.dir_y[lane] = query.ray.dir_y;
+      packet.ray.dir_z[lane] = query.ray.dir_z;
+      packet.ray.tnear[lane] = query.ray.tnear;
+      packet.ray.tfar[lane] = query.ray.tfar;
+      packet.ray.mask[lane] = query.ray.mask;
+      packet.ray.flags[lane] = query.ray.flags;
+      packet.hit.geomID[lane] = RTC_INVALID_GEOMETRY_ID;
+      packet.hit.primID[lane] = RTC_INVALID_GEOMETRY_ID;
+    }
+    rtcIntersect8(valid, scene_handle_, &packet, &arguments);
+    for (std::size_t lane = 0; lane < width; ++lane) {
+      RTCRayHit query{};
+      query.ray.org_x = packet.ray.org_x[lane];
+      query.ray.org_y = packet.ray.org_y[lane];
+      query.ray.org_z = packet.ray.org_z[lane];
+      query.ray.dir_x = packet.ray.dir_x[lane];
+      query.ray.dir_y = packet.ray.dir_y[lane];
+      query.ray.dir_z = packet.ray.dir_z[lane];
+      query.ray.tnear = packet.ray.tnear[lane];
+      query.ray.tfar = packet.ray.tfar[lane];
+      query.hit.geomID = packet.hit.geomID[lane];
+      query.hit.primID = packet.hit.primID[lane];
+      query.hit.u = packet.hit.u[lane];
+      query.hit.v = packet.hit.v[lane];
+      query.hit.Ng_x = packet.hit.Ng_x[lane];
+      query.hit.Ng_y = packet.hit.Ng_y[lane];
+      query.hit.Ng_z = packet.hit.Ng_z[lane];
+      result[begin + lane] =
+          decode_intersection(rays[begin + lane], domain, query);
+    }
+  }
+  for (; begin < rays.size(); ++begin)
+    result[begin] = intersect(rays[begin], domain);
+  return result;
+}
+
+std::optional<Hit> Geometry::intersect_declared_analytic(
+    std::uint32_t primitive_index, const Ray& ray,
+    std::int32_t domain) const {
+  if (primitive_index >= scene_->mesh.analytic_primitives.size())
+    throw std::runtime_error(
+        "declared analytic source primitive is out of range");
+  const auto analytic = intersect_analytic_primitive(
+      scene_->mesh.analytic_primitives.at(primitive_index), primitive_index,
+      ray, domain);
+  if (!analytic) return std::nullopt;
+  const auto& primitive =
+      scene_->mesh.analytic_primitives.at(primitive_index);
+  const auto element = locate_analytic_surface_element(
+      primitive_index, analytic->coordinates, analytic->normal);
+  if (element) {
+    const auto& basis =
+        scene_->mesh.analytic_surface_elements.at(*element);
+    return Hit{true,
+               primitive.kind,
+               analytic_surface_element_geometry_key(*element),
+               primitive_index,
+               primitive.surface_id,
+               analytic->distance,
+               analytic->normal,
+               primitive.minus_domain_id,
+               primitive.plus_domain_id,
+               primitive.channel_id,
+               basis.surface_basis_id,
+               basis.surface_element,
+               analytic->coordinates};
+  }
+  return Hit{true,
+             primitive.kind,
+             analytic_geometry_key(primitive_index),
+             primitive_index,
+             primitive.surface_id,
+             analytic->distance,
+             analytic->normal,
+             primitive.minus_domain_id,
+             primitive.plus_domain_id,
+             primitive.channel_id,
+             primitive.surface_basis_id,
+             primitive.surface_element,
+             analytic->coordinates};
+}
+
+std::vector<Hit> Geometry::intersect_batch(
+    const std::vector<Ray>& rays,
+    const std::vector<std::int32_t>& domains) const {
+  if (rays.size() != domains.size())
+    throw std::runtime_error(
+        "mixed-domain ray and domain counts differ");
+  std::unordered_map<std::int32_t, std::vector<std::size_t>> groups;
+  for (std::size_t index = 0; index < domains.size(); ++index)
+    groups[domains[index]].push_back(index);
+  std::vector<Hit> result(rays.size());
+  for (const auto& [domain, indices] : groups) {
+    std::vector<Ray> grouped_rays;
+    grouped_rays.reserve(indices.size());
+    for (const auto index : indices) grouped_rays.push_back(rays[index]);
+    const auto grouped_hits = intersect_batch(grouped_rays, domain);
+    for (std::size_t offset = 0; offset < indices.size(); ++offset)
+      result[indices[offset]] = grouped_hits[offset];
+  }
+  return result;
+}
+
+Hit Geometry::decode_intersection(
+    const Ray& ray, std::int32_t domain, const RTCRayHit& query) const {
   if (query.hit.geomID == RTC_INVALID_GEOMETRY_ID) return {};
   Hit triangle_hit;
   if (query.hit.geomID == triangle_geometry_id_) {

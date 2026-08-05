@@ -1,12 +1,13 @@
 #include "oos/hash.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
-#include <vector>
 
 namespace oos {
 namespace {
@@ -27,31 +28,68 @@ constexpr std::array<std::uint32_t, 64> constants{
 std::uint32_t rotate(std::uint32_t value, unsigned bits) {
   return (value >> bits) | (value << (32 - bits));
 }
-std::string digest(const std::vector<std::uint8_t>& input) {
-  std::vector<std::uint8_t> bytes = input;
-  const std::uint64_t bits = static_cast<std::uint64_t>(bytes.size()) * 8;
-  bytes.push_back(0x80);
-  while (bytes.size() % 64 != 56) bytes.push_back(0);
-  for (int shift = 56; shift >= 0; shift -= 8)
-    bytes.push_back(static_cast<std::uint8_t>(bits >> shift));
-  std::array<std::uint32_t, 8> hash{
-      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-  for (std::size_t offset = 0; offset < bytes.size(); offset += 64) {
+class Sha256State {
+ public:
+  void update(const void* data_value, std::size_t size) {
+    const auto* data = static_cast<const std::uint8_t*>(data_value);
+    total_bytes_ += size;
+    if (buffer_size_ != 0) {
+      const auto copied = std::min(size, buffer_.size() - buffer_size_);
+      std::memcpy(buffer_.data() + buffer_size_, data, copied);
+      buffer_size_ += copied;
+      data += copied;
+      size -= copied;
+      if (buffer_size_ == buffer_.size()) {
+        transform(buffer_.data());
+        buffer_size_ = 0;
+      }
+    }
+    while (size >= buffer_.size()) {
+      transform(data);
+      data += buffer_.size();
+      size -= buffer_.size();
+    }
+    if (size != 0) {
+      std::memcpy(buffer_.data(), data, size);
+      buffer_size_ = size;
+    }
+  }
+
+  std::string finish() {
+    const std::uint64_t bits = total_bytes_ * 8;
+    std::array<std::uint8_t, 128> padding{};
+    padding[0] = 0x80;
+    const std::size_t padding_size =
+        buffer_size_ < 56 ? 56 - buffer_size_ : 120 - buffer_size_;
+    update(padding.data(), padding_size);
+    std::array<std::uint8_t, 8> length{};
+    for (int index = 0; index < 8; ++index)
+      length[index] = static_cast<std::uint8_t>(bits >> (56 - 8 * index));
+    update(length.data(), length.size());
+    std::ostringstream result;
+    result << std::hex << std::setfill('0');
+    for (const auto value : hash_) result << std::setw(8) << value;
+    return result.str();
+  }
+
+ private:
+  void transform(const std::uint8_t* bytes) {
     std::array<std::uint32_t, 64> words{};
     for (int i = 0; i < 16; ++i)
-      words[i] = (static_cast<std::uint32_t>(bytes[offset + 4 * i]) << 24) |
-                 (static_cast<std::uint32_t>(bytes[offset + 4 * i + 1]) << 16) |
-                 (static_cast<std::uint32_t>(bytes[offset + 4 * i + 2]) << 8) |
-                 bytes[offset + 4 * i + 3];
+      words[i] = (static_cast<std::uint32_t>(bytes[4 * i]) << 24) |
+                 (static_cast<std::uint32_t>(bytes[4 * i + 1]) << 16) |
+                 (static_cast<std::uint32_t>(bytes[4 * i + 2]) << 8) |
+                 bytes[4 * i + 3];
     for (int i = 16; i < 64; ++i) {
-      const auto s0 = rotate(words[i - 15], 7) ^ rotate(words[i - 15], 18) ^
+      const auto s0 = rotate(words[i - 15], 7) ^
+                      rotate(words[i - 15], 18) ^
                       (words[i - 15] >> 3);
-      const auto s1 = rotate(words[i - 2], 17) ^ rotate(words[i - 2], 19) ^
+      const auto s1 = rotate(words[i - 2], 17) ^
+                      rotate(words[i - 2], 19) ^
                       (words[i - 2] >> 10);
       words[i] = words[i - 16] + s0 + words[i - 7] + s1;
     }
-    auto [a, b, c, d, e, f, g, h] = hash;
+    auto [a, b, c, d, e, f, g, h] = hash_;
     for (int i = 0; i < 64; ++i) {
       const auto s1 = rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25);
       const auto choice = (e & f) ^ ((~e) & g);
@@ -68,31 +106,43 @@ std::string digest(const std::vector<std::uint8_t>& input) {
       b = a;
       a = temp1 + temp2;
     }
-    hash[0] += a;
-    hash[1] += b;
-    hash[2] += c;
-    hash[3] += d;
-    hash[4] += e;
-    hash[5] += f;
-    hash[6] += g;
-    hash[7] += h;
+    hash_[0] += a;
+    hash_[1] += b;
+    hash_[2] += c;
+    hash_[3] += d;
+    hash_[4] += e;
+    hash_[5] += f;
+    hash_[6] += g;
+    hash_[7] += h;
   }
-  std::ostringstream result;
-  result << std::hex << std::setfill('0');
-  for (const auto value : hash) result << std::setw(8) << value;
-  return result.str();
-}
+
+  std::array<std::uint32_t, 8> hash_{
+      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  std::array<std::uint8_t, 64> buffer_{};
+  std::size_t buffer_size_{};
+  std::uint64_t total_bytes_{};
+};
 }  // namespace
 
 std::string sha256_string(std::string_view value) {
-  return digest({value.begin(), value.end()});
+  Sha256State state;
+  state.update(value.data(), value.size());
+  return state.finish();
 }
 std::string sha256_file(const std::filesystem::path& path) {
   std::ifstream stream(path, std::ios::binary);
   if (!stream) throw std::runtime_error("cannot hash " + path.string());
-  std::vector<std::uint8_t> bytes(
-      (std::istreambuf_iterator<char>(stream)),
-      std::istreambuf_iterator<char>());
-  return digest(bytes);
+  Sha256State state;
+  std::array<char, 1024 * 1024> buffer{};
+  while (stream) {
+    stream.read(buffer.data(), buffer.size());
+    const auto count = stream.gcount();
+    if (count > 0)
+      state.update(buffer.data(), static_cast<std::size_t>(count));
+  }
+  if (!stream.eof())
+    throw std::runtime_error("failed while hashing " + path.string());
+  return state.finish();
 }
 }  // namespace oos

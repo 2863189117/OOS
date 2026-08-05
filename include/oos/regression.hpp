@@ -26,8 +26,11 @@ struct ResponseGrid {
   std::vector<float> conditional_log_probability;
   std::vector<double> top_efficiency;
   std::vector<std::int32_t> channel_ids;
+  std::string fingerprint_sha256;
+  std::string effective_response_fingerprint_sha256;
   std::string effective_response_sha256;
   std::string source_angular_mode;
+  std::string source_backend{"auto"};
   double source_z_mm{};
   double source_thickness_mm{};
   std::uint32_t source_transverse_count{};
@@ -36,9 +39,15 @@ struct ResponseGrid {
   double source_medium_z_max_mm{};
   std::uint32_t source_mu_order{};
   std::uint32_t source_phi_count{};
+  double source_relative_tolerance{1.0e-5};
+  std::uint32_t source_maximum_subdivision_depth{8};
+  std::uint32_t structured_disk_mu_order{31};
+  std::uint32_t structured_disk_phi_count{64};
 
   void validate() const;
 };
+
+std::string response_grid_fingerprint(const ResponseGrid& grid);
 
 struct RegressionResult {
   std::uint64_t events{};

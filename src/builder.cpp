@@ -12,7 +12,16 @@
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <limits>
+#include <iterator>
+#include <mutex>
+#include <new>
+#include <type_traits>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -69,6 +78,57 @@ std::vector<std::pair<double, double>> gauss_legendre_unit_interval(
   return result;
 }
 
+struct EmbeddedQuadratureNode {
+  double unit_node{};
+  double high_weight{};
+  double low_weight{};
+};
+
+const std::vector<EmbeddedQuadratureNode>&
+gauss_kronrod_15_31_unit_interval() {
+  // QUADPACK DQK31 coefficients. Odd (zero-based) Kronrod abscissae are the
+  // embedded 15-point Gauss rule; both rules are mapped from [-1,1] to [0,1].
+  static const std::vector<EmbeddedQuadratureNode> nodes = [] {
+    constexpr std::array<double, 16> x{
+        0.99800229869339706029, 0.98799251802048542849,
+        0.96773907567913913426, 0.93727339240070590431,
+        0.89726453234408190088, 0.84820658341042721620,
+        0.79041850144246593297, 0.72441773136017004742,
+        0.65099674129741697053, 0.57097217260853884754,
+        0.48508186364023968069, 0.39415134707756336990,
+        0.29918000715316881217, 0.20119409399743452230,
+        0.10114206691871749903, 0.0};
+    constexpr std::array<double, 16> kronrod{
+        0.00537747987292334899, 0.01500794732931612254,
+        0.02546084732671532019, 0.03534636079137584622,
+        0.04458975132476487661, 0.05348152469092808727,
+        0.06200956780067064029, 0.06985412131872825871,
+        0.07684968075772037889, 0.08308050282313302104,
+        0.08856444305621177065, 0.09312659817082532123,
+        0.09664272698362367851, 0.09917359872179195933,
+        0.10076984552387559504, 0.10133000701479154902};
+    constexpr std::array<double, 8> gauss{
+        0.03075324199611726835, 0.07036604748810812471,
+        0.10715922046717193501, 0.13957067792615431445,
+        0.16626920581699393355, 0.18616100001556221103,
+        0.19843148532711157646, 0.20257824192556127288};
+    std::vector<EmbeddedQuadratureNode> result;
+    result.reserve(31);
+    for (std::size_t index = 0; index + 1 < x.size(); ++index) {
+      const double low =
+          index % 2 == 1 ? 0.5 * gauss[(index - 1) / 2] : 0.0;
+      result.push_back(
+          {0.5 * (1.0 - x[index]), 0.5 * kronrod[index], low});
+      result.push_back(
+          {0.5 * (1.0 + x[index]), 0.5 * kronrod[index], low});
+    }
+    result.push_back({0.5, 0.5 * kronrod.back(),
+                      0.5 * gauss.back()});
+    return result;
+  }();
+  return nodes;
+}
+
 Vec3 add(const Vec3& a, const Vec3& b) {
   return {a.x + b.x, a.y + b.y, a.z + b.z};
 }
@@ -121,10 +181,339 @@ struct WeightedRay {
   std::optional<Hit> known_first_hit;
 };
 
+template <std::size_t InlineCapacity = 16>
+class SmallSparseMap {
+ public:
+  using Entry = std::pair<std::uint32_t, double>;
+  using EntryStorage =
+      std::aligned_storage_t<sizeof(Entry), alignof(Entry)>;
+  static_assert(std::is_trivially_destructible_v<Entry>);
+
+  SmallSparseMap() noexcept = default;
+  SmallSparseMap(const SmallSparseMap& other) {
+    for (const auto& [index, value] : other) (*this)[index] = value;
+  }
+  SmallSparseMap& operator=(const SmallSparseMap& other) {
+    if (this == &other) return *this;
+    clear();
+    for (const auto& [index, value] : other) (*this)[index] = value;
+    return *this;
+  }
+  SmallSparseMap(SmallSparseMap&& other) noexcept {
+    move_from(std::move(other));
+  }
+  SmallSparseMap& operator=(SmallSparseMap&& other) noexcept {
+    if (this == &other) return *this;
+    clear();
+    move_from(std::move(other));
+    return *this;
+  }
+
+  template <bool IsConst>
+  class BasicIterator {
+   public:
+    using Owner = std::conditional_t<IsConst, const SmallSparseMap,
+                                     SmallSparseMap>;
+    using reference = std::conditional_t<IsConst, const Entry&, Entry&>;
+    using value_type = Entry;
+    using difference_type = std::ptrdiff_t;
+    using iterator_category = std::forward_iterator_tag;
+
+    reference operator*() const { return owner_->entry_at(index_); }
+    auto operator->() const { return &owner_->entry_at(index_); }
+    BasicIterator& operator++() {
+      ++index_;
+      return *this;
+    }
+    bool operator==(const BasicIterator& other) const {
+      return owner_ == other.owner_ && index_ == other.index_;
+    }
+    bool operator!=(const BasicIterator& other) const {
+      return !(*this == other);
+    }
+
+   private:
+    friend class SmallSparseMap;
+    BasicIterator(Owner* owner, std::size_t index)
+        : owner_(owner), index_(index) {}
+    Owner* owner_{};
+    std::size_t index_{};
+  };
+
+  using iterator = BasicIterator<false>;
+  using const_iterator = BasicIterator<true>;
+
+  double& operator[](std::uint32_t key) {
+    if (!spilled_) {
+      for (std::size_t index = 0; index < inline_size_; ++index)
+        if (inline_entry(index).first == key)
+          return inline_entry(index).second;
+      if (inline_size_ < InlineCapacity) {
+        auto* entry = new (&inline_storage_[inline_size_])
+            Entry{key, 0.0};
+        ++inline_size_;
+        return entry->second;
+      }
+      spill();
+    }
+    const auto found = spill_index_.find(key);
+    if (found != spill_index_.end())
+      return spill_entries_[found->second].second;
+    const auto index = spill_entries_.size();
+    spill_entries_.push_back({key, 0.0});
+    spill_index_.emplace(key, index);
+    return spill_entries_.back().second;
+  }
+
+  bool contains(std::uint32_t key) const {
+    if (!spilled_) {
+      for (std::size_t index = 0; index < inline_size_; ++index)
+        if (inline_entry(index).first == key) return true;
+      return false;
+    }
+    return spill_index_.count(key) != 0;
+  }
+
+  double value(std::uint32_t key) const {
+    if (!spilled_) {
+      for (std::size_t index = 0; index < inline_size_; ++index)
+        if (inline_entry(index).first == key)
+          return inline_entry(index).second;
+      return 0.0;
+    }
+    const auto found = spill_index_.find(key);
+    return found == spill_index_.end()
+               ? 0.0
+               : spill_entries_[found->second].second;
+  }
+
+  std::size_t size() const {
+    return spilled_ ? spill_entries_.size() : inline_size_;
+  }
+  bool empty() const { return size() == 0; }
+  iterator begin() { return iterator(this, 0); }
+  iterator end() { return iterator(this, size()); }
+  const_iterator begin() const { return const_iterator(this, 0); }
+  const_iterator end() const { return const_iterator(this, size()); }
+
+ private:
+  Entry& entry_at(std::size_t index) {
+    return spilled_ ? spill_entries_[index] : inline_entry(index);
+  }
+  const Entry& entry_at(std::size_t index) const {
+    return spilled_ ? spill_entries_[index] : inline_entry(index);
+  }
+  Entry& inline_entry(std::size_t index) {
+    return *std::launder(
+        reinterpret_cast<Entry*>(&inline_storage_[index]));
+  }
+  const Entry& inline_entry(std::size_t index) const {
+    return *std::launder(
+        reinterpret_cast<const Entry*>(&inline_storage_[index]));
+  }
+  void spill() {
+    spilled_ = true;
+    spill_entries_.reserve(2 * InlineCapacity);
+    spill_index_.reserve(2 * InlineCapacity);
+    for (std::size_t index = 0; index < inline_size_; ++index) {
+      spill_index_.emplace(inline_entry(index).first,
+                           spill_entries_.size());
+      spill_entries_.push_back(inline_entry(index));
+    }
+  }
+
+  void clear() {
+    inline_size_ = 0;
+    spilled_ = false;
+    spill_entries_.clear();
+    spill_index_.clear();
+  }
+
+  void move_from(SmallSparseMap&& other) {
+    if (other.spilled_) {
+      spilled_ = true;
+      spill_entries_ = std::move(other.spill_entries_);
+      spill_index_ = std::move(other.spill_index_);
+      other.inline_size_ = 0;
+      other.spilled_ = false;
+      return;
+    }
+    for (const auto& [index, value] : other) (*this)[index] = value;
+    other.inline_size_ = 0;
+  }
+
+  std::array<EntryStorage, InlineCapacity> inline_storage_;
+  std::size_t inline_size_{};
+  bool spilled_{};
+  std::vector<Entry> spill_entries_;
+  std::unordered_map<std::uint32_t, std::size_t> spill_index_;
+};
+
 struct RowAccumulation {
-  std::map<std::uint32_t, double> transition;
-  std::map<std::uint32_t, double> detection;
-  std::map<std::uint32_t, double> losses;
+  SmallSparseMap<> transition;
+  SmallSparseMap<> detection;
+  SmallSparseMap<> losses;
+};
+
+std::map<std::uint32_t, double> ordered_map(
+    const SmallSparseMap<>& source) {
+  std::map<std::uint32_t, double> result;
+  for (const auto& [index, value] : source)
+    if (value != 0.0) result.emplace(index, value);
+  return result;
+}
+
+class DenseComponentAccumulator {
+ public:
+  void reset(std::size_t size) {
+    if (values_.size() != size) {
+      values_.assign(size, 0.0);
+      touched_mask_.assign(size, 0);
+    } else {
+      for (const auto index : touched_) {
+        values_[index] = 0.0;
+        touched_mask_[index] = 0;
+      }
+    }
+    touched_.clear();
+  }
+
+  void add(std::uint32_t index, double value) {
+    if (index >= values_.size())
+      throw std::runtime_error(
+          "source accumulation index is out of range: index=" +
+          std::to_string(index) + " size=" +
+          std::to_string(values_.size()));
+    if (!touched_mask_[index]) {
+      touched_mask_[index] = 1;
+      touched_.push_back(index);
+    }
+    values_[index] += value;
+  }
+
+  void add(const SmallSparseMap<>& source, double factor = 1.0) {
+    for (const auto& [index, value] : source)
+      add(index, factor * value);
+  }
+
+  void add(const DenseComponentAccumulator& source,
+           double factor = 1.0) {
+    for (const auto index : source.touched_)
+      add(index, factor * source.values_[index]);
+  }
+
+  double total() const {
+    double result = 0.0;
+    for (const auto index : touched_) result += values_[index];
+    return result;
+  }
+
+  double l1_difference(const DenseComponentAccumulator& other) const {
+    if (values_.size() != other.values_.size())
+      throw std::runtime_error(
+          "source accumulators have incompatible dimensions");
+    double result = 0.0;
+    for (const auto index : touched_)
+      result += std::abs(values_[index] - other.values_[index]);
+    for (const auto index : other.touched_)
+      if (!touched_mask_[index]) result += std::abs(other.values_[index]);
+    return result;
+  }
+
+  void scale_values(double factor) {
+    for (const auto index : touched_) values_[index] *= factor;
+  }
+
+  void append_to(SmallSparseMap<>& target) const {
+    for (const auto index : touched_)
+      if (values_[index] != 0.0) target[index] += values_[index];
+  }
+
+  void store_to(std::vector<double>& target, std::size_t offset) const {
+    if (offset + values_.size() > target.size())
+      throw std::runtime_error(
+          "source output accumulation is out of range");
+    for (const auto index : touched_)
+      target[offset + index] = values_[index];
+  }
+
+ private:
+  std::vector<double> values_;
+  std::vector<std::uint8_t> touched_mask_;
+  std::vector<std::uint32_t> touched_;
+};
+
+class DenseRowAccumulator {
+ public:
+  void reset(std::size_t transition_count, std::size_t detection_count,
+             std::size_t loss_count) {
+    transition.reset(transition_count);
+    detection.reset(detection_count);
+    losses.reset(loss_count);
+  }
+
+  void add(const RowAccumulation& source, double factor = 1.0) {
+    transition.add(source.transition, factor);
+    detection.add(source.detection, factor);
+    losses.add(source.losses, factor);
+  }
+
+  void add(const DenseRowAccumulator& source, double factor = 1.0) {
+    transition.add(source.transition, factor);
+    detection.add(source.detection, factor);
+    losses.add(source.losses, factor);
+  }
+
+  void add_transition(std::uint32_t index, double value) {
+    if (value != 0.0) transition.add(index, value);
+  }
+  void add_detection(std::uint32_t index, double value) {
+    if (value != 0.0) detection.add(index, value);
+  }
+  void add_loss(std::uint32_t index, double value) {
+    if (value != 0.0) losses.add(index, value);
+  }
+
+  double total() const {
+    return transition.total() + detection.total() + losses.total();
+  }
+
+
+  double l1_difference(const DenseRowAccumulator& other) const {
+    return transition.l1_difference(other.transition) +
+           detection.l1_difference(other.detection) +
+           losses.l1_difference(other.losses);
+  }
+
+  void scale_values(double factor) {
+    transition.scale_values(factor);
+    detection.scale_values(factor);
+    losses.scale_values(factor);
+  }
+
+  RowAccumulation sparse() const {
+    RowAccumulation result;
+    transition.append_to(result.transition);
+    detection.append_to(result.detection);
+    losses.append_to(result.losses);
+    return result;
+  }
+
+  void store_to(SourceBatch& batch, std::size_t source_index,
+                std::size_t transition_count,
+                std::size_t detection_count,
+                std::size_t loss_count) const {
+    transition.store_to(batch.initial_states,
+                        source_index * transition_count);
+    detection.store_to(batch.direct_detection,
+                       source_index * detection_count);
+    losses.store_to(batch.direct_losses, source_index * loss_count);
+  }
+
+ private:
+  DenseComponentAccumulator transition;
+  DenseComponentAccumulator detection;
+  DenseComponentAccumulator losses;
 };
 
 struct SurfaceEmitter {
@@ -267,6 +656,202 @@ struct CustomSurfaceRuntime {
 using CustomRuntimeMap =
     std::unordered_map<std::uint32_t, CustomSurfaceRuntime>;
 
+class StructuredAnalyticIntersector {
+ public:
+  StructuredAnalyticIntersector(const Scene& scene, const Geometry& geometry)
+      : scene_(scene), geometry_(geometry) {
+    const auto& primitives = scene.mesh.analytic_primitives;
+    for (std::uint32_t index = 0; index < primitives.size(); ++index) {
+      const auto& primitive = primitives[index];
+      if (primitive.kind != GeometryPrimitiveKind::perforated_disk ||
+          primitive.holes.empty())
+        continue;
+      Aperture aperture;
+      aperture.primitive = index;
+      aperture.maximum_radius = 0.0;
+      aperture.stacks.resize(primitive.holes.size());
+      for (const auto& hole : primitive.holes)
+        aperture.maximum_radius =
+            std::max(aperture.maximum_radius, hole.radius_mm);
+      aperture.cell_size = std::max(2.0 * aperture.maximum_radius,
+                                    scene.numerics.geometry_tolerance_mm);
+      for (std::uint32_t hole = 0; hole < primitive.holes.size(); ++hole) {
+        const auto& center = primitive.holes[hole].center_uv_mm;
+        aperture.cells[cell(center.x, center.y, aperture.cell_size)]
+            .push_back(hole);
+      }
+      apertures_.push_back(std::move(aperture));
+    }
+
+    std::unordered_set<std::uint64_t> assigned;
+    for (std::size_t aperture_index = 0;
+         aperture_index < apertures_.size(); ++aperture_index) {
+      auto& aperture = apertures_[aperture_index];
+      const auto& plane = primitives.at(aperture.primitive);
+      for (std::uint32_t index = 0; index < primitives.size(); ++index) {
+        if (index == aperture.primitive) continue;
+        const auto& primitive = primitives[index];
+        if (primitive.kind != GeometryPrimitiveKind::disk &&
+            primitive.kind != GeometryPrimitiveKind::finite_cylinder)
+          continue;
+        const Vec3 relative = subtract(primitive.center_mm, plane.center_mm);
+        const double u = dot(relative, plane.axis_x);
+        const double v = dot(relative, plane.axis_y);
+        const auto hole = locate(aperture, u, v);
+        if (!hole) continue;
+        const auto& expected = plane.holes.at(*hole);
+        const double radius = primitive.parameters[0];
+        const double scale = std::max({1.0, radius, expected.radius_mm});
+        if (std::abs(radius - expected.radius_mm) >
+            32.0 * scene.numerics.geometry_tolerance_mm * scale)
+          continue;
+        for (const auto domain : {primitive.minus_domain_id,
+                                  primitive.plus_domain_id}) {
+          if (!scene.media.count(domain)) continue;
+          aperture.stacks[*hole][domain].push_back(index);
+          assigned.insert(domain_primitive_key(domain, index));
+          apertures_by_domain_[domain].push_back(aperture_index);
+        }
+      }
+      for (const auto domain : {plane.minus_domain_id,
+                                plane.plus_domain_id})
+        if (scene.media.count(domain))
+          apertures_by_domain_[domain].push_back(aperture_index);
+    }
+    for (auto& [domain, indices] : apertures_by_domain_) {
+      std::sort(indices.begin(), indices.end());
+      indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+      (void)domain;
+    }
+
+    for (std::uint32_t index = 0; index < primitives.size(); ++index) {
+      const auto& primitive = primitives[index];
+      for (const auto domain : {primitive.minus_domain_id,
+                                primitive.plus_domain_id}) {
+        if (!scene.media.count(domain) ||
+            assigned.count(domain_primitive_key(domain, index)))
+          continue;
+        global_by_domain_[domain].push_back(index);
+      }
+    }
+  }
+
+  Hit intersect(const Ray& ray, std::int32_t domain) const {
+    thread_local std::vector<std::uint32_t> candidates;
+    candidates.clear();
+    const auto append = [&](std::uint32_t primitive) {
+      if (std::find(candidates.begin(), candidates.end(), primitive) ==
+          candidates.end())
+        candidates.push_back(primitive);
+    };
+    if (const auto found = global_by_domain_.find(domain);
+        found != global_by_domain_.end())
+      for (const auto primitive : found->second) append(primitive);
+
+    if (const auto found = apertures_by_domain_.find(domain);
+        found != apertures_by_domain_.end()) {
+      const Vec3 direction = normalized(ray.direction);
+      for (const auto aperture_index : found->second) {
+        const auto& aperture = apertures_.at(aperture_index);
+        const auto& plane =
+            scene_.mesh.analytic_primitives.at(aperture.primitive);
+        std::array<std::optional<std::uint32_t>, 2> holes;
+        const Vec3 origin_relative = subtract(ray.origin, plane.center_mm);
+        holes[0] = locate(aperture, dot(origin_relative, plane.axis_x),
+                          dot(origin_relative, plane.axis_y));
+        const double denominator = dot(direction, plane.axis_z);
+        if (std::abs(denominator) >
+            64.0 * std::numeric_limits<double>::epsilon()) {
+          const double distance =
+              dot(subtract(plane.center_mm, ray.origin), plane.axis_z) /
+              denominator;
+          if (distance >= ray.t_min && distance <= ray.t_max) {
+            const Vec3 point = add(ray.origin, scale(direction, distance));
+            const Vec3 relative = subtract(point, plane.center_mm);
+            holes[1] = locate(aperture, dot(relative, plane.axis_x),
+                              dot(relative, plane.axis_y));
+          }
+        }
+        for (const auto hole : holes) {
+          if (!hole) continue;
+          const auto stack = aperture.stacks[*hole].find(domain);
+          if (stack == aperture.stacks[*hole].end()) continue;
+          for (const auto primitive : stack->second) append(primitive);
+        }
+      }
+    }
+
+    std::optional<Hit> closest;
+    for (const auto primitive : candidates) {
+      const auto hit = geometry_.intersect_declared_analytic(
+          primitive, ray, domain);
+      if (hit && (!closest || hit->distance < closest->distance))
+        closest = hit;
+    }
+    // A structured scene can still contain an explicitly unstructured domain
+    // or a ray on a topology seam. Preserve correctness with a fail-closed BVH
+    // fallback; fully declared structured rays do not take this branch.
+    return closest ? *closest : geometry_.intersect(ray, domain);
+  }
+
+ private:
+  using Cell = std::pair<std::int64_t, std::int64_t>;
+  struct Aperture {
+    std::uint32_t primitive{};
+    double maximum_radius{};
+    double cell_size{1.0};
+    std::map<Cell, std::vector<std::uint32_t>> cells;
+    std::vector<std::unordered_map<std::int32_t,
+                                   std::vector<std::uint32_t>>>
+        stacks;
+  };
+
+  static Cell cell(double u, double v, double size) {
+    return {static_cast<std::int64_t>(std::floor(u / size)),
+            static_cast<std::int64_t>(std::floor(v / size))};
+  }
+  static std::uint64_t domain_primitive_key(std::int32_t domain,
+                                             std::uint32_t primitive) {
+    return (static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(domain))
+            << 32u) |
+           primitive;
+  }
+  std::optional<std::uint32_t> locate(const Aperture& aperture, double u,
+                                      double v) const {
+    const auto base = cell(u, v, aperture.cell_size);
+    const auto& plane =
+        scene_.mesh.analytic_primitives.at(aperture.primitive);
+    std::optional<std::uint32_t> result;
+    double best = std::numeric_limits<double>::infinity();
+    for (std::int64_t du = -1; du <= 1; ++du)
+      for (std::int64_t dv = -1; dv <= 1; ++dv) {
+        const auto found =
+            aperture.cells.find({base.first + du, base.second + dv});
+        if (found == aperture.cells.end()) continue;
+        for (const auto index : found->second) {
+          const auto& hole = plane.holes.at(index);
+          const double d2 =
+              (u - hole.center_uv_mm.x) * (u - hole.center_uv_mm.x) +
+              (v - hole.center_uv_mm.y) * (v - hole.center_uv_mm.y);
+          if (d2 <= hole.radius_mm * hole.radius_mm && d2 < best) {
+            best = d2;
+            result = index;
+          }
+        }
+      }
+    return result;
+  }
+
+  const Scene& scene_;
+  const Geometry& geometry_;
+  std::vector<Aperture> apertures_;
+  std::unordered_map<std::int32_t, std::vector<std::size_t>>
+      apertures_by_domain_;
+  std::unordered_map<std::int32_t, std::vector<std::uint32_t>>
+      global_by_domain_;
+};
+
 oos_surface_hit_v3 plugin_hit(const Scene& scene, const SurfaceModel& surface,
                               const WeightedRay& ray, const Hit& hit,
                               const Vec3& point,
@@ -385,8 +970,13 @@ void trace_branch(const Scene& scene, const Geometry& geometry,
                   const std::unordered_map<std::int32_t, std::uint32_t>&
                       channel_to_column,
                   const CustomRuntimeMap& custom_runtimes,
-                  const WeightedRay& input, RowAccumulation& output) {
-  std::vector<WeightedRay> pending{input};
+                  const WeightedRay& input, RowAccumulation& output,
+                  const StructuredAnalyticIntersector* structured = nullptr) {
+  thread_local std::vector<WeightedRay> pending;
+  pending.clear();
+  if (pending.capacity() < scene.numerics.maximum_specular_hits + 1)
+    pending.reserve(scene.numerics.maximum_specular_hits + 1);
+  pending.push_back(input);
   while (!pending.empty()) {
     WeightedRay ray = pending.back();
     pending.pop_back();
@@ -398,9 +988,11 @@ void trace_branch(const Scene& scene, const Geometry& geometry,
       output.losses[3] += ray.stokes.i;
       continue;
     }
-    const Hit hit = ray.known_first_hit
-                        ? *ray.known_first_hit
-                        : geometry.intersect(ray.ray, ray.domain);
+    const Hit hit =
+        ray.known_first_hit
+            ? *ray.known_first_hit
+            : structured ? structured->intersect(ray.ray, ray.domain)
+                         : geometry.intersect(ray.ray, ray.domain);
     if (!hit.valid) {
       // Scene validation has already established that the traced domain is
       // enclosed.  A no-hit result is therefore kept separate from physical
@@ -648,40 +1240,13 @@ void add_row(RowAccumulation& target, const RowAccumulation& source,
     target.losses[column] += factor * value;
 }
 
-void scale_row(RowAccumulation& row, double factor) {
-  for (auto& [column, value] : row.transition) {
-    (void)column;
-    value *= factor;
-  }
-  for (auto& [column, value] : row.detection) {
-    (void)column;
-    value *= factor;
-  }
-  for (auto& [column, value] : row.losses) {
-    (void)column;
-    value *= factor;
-  }
-}
-
-double map_l1_difference(const std::map<std::uint32_t, double>& first,
-                         const std::map<std::uint32_t, double>& second) {
-  auto a = first.begin();
-  auto b = second.begin();
+double map_l1_difference(const SmallSparseMap<>& first,
+                         const SmallSparseMap<>& second) {
   double result = 0.0;
-  while (a != first.end() || b != second.end()) {
-    if (b == second.end() ||
-        (a != first.end() && a->first < b->first)) {
-      result += std::abs(a->second);
-      ++a;
-    } else if (a == first.end() || b->first < a->first) {
-      result += std::abs(b->second);
-      ++b;
-    } else {
-      result += std::abs(a->second - b->second);
-      ++a;
-      ++b;
-    }
-  }
+  for (const auto& [column, value] : first)
+    result += std::abs(value - second.value(column));
+  for (const auto& [column, value] : second)
+    if (!first.contains(column)) result += std::abs(value);
   return result;
 }
 
@@ -828,8 +1393,20 @@ struct ShapeFactorTraceContext {
   const std::unordered_map<std::uint64_t, std::uint32_t>& primitive_to_state;
   const std::unordered_map<std::int32_t, std::uint32_t>& channel_to_column;
   const CustomRuntimeMap& custom_runtimes;
+  const StructuredAnalyticIntersector* structured_intersector;
   const SourcePoint& source;
   const ShapeFactorOptions& options;
+};
+
+struct ShapeFactorBoundaryCandidate {
+  std::uint32_t index{};
+  Vec3 center;
+  Vec3 outward;
+};
+
+struct ShapeFactorDomainCandidates {
+  std::vector<ShapeFactorBoundaryCandidate> triangles;
+  std::vector<ShapeFactorBoundaryCandidate> analytic_elements;
 };
 
 ShapeFactorTriangleSample sample_shape_factor_triangle(
@@ -859,10 +1436,41 @@ ShapeFactorTriangleSample sample_shape_factor_triangle(
 RowAccumulation evaluate_shape_factor_triangle(
     const ShapeFactorTraceContext& context,
     const ShapeFactorTriangle& triangle,
-    const ShapeFactorTriangleSample& sample) {
+    const ShapeFactorTriangleSample& sample,
+    const Hit* known_first_hit = nullptr) {
   RowAccumulation result;
-  const Hit first = context.geometry.intersect(
-      {context.source.position, sample.direction}, context.source.domain);
+  Hit first;
+  if (known_first_hit) {
+    first = *known_first_hit;
+  } else {
+    const auto missing = std::numeric_limits<std::uint32_t>::max();
+    const auto replacement =
+        context.scene.mesh.triangle_source_analytic_primitive.empty()
+            ? missing
+            : context.scene.mesh.triangle_source_analytic_primitive.at(
+                  triangle.primitive);
+    const bool structured =
+        context.options.backend != ShapeFactorBackend::generic_bvh &&
+        replacement != missing;
+    if (structured) {
+      const auto hit = context.geometry.intersect_declared_analytic(
+          replacement, {context.source.position, sample.direction},
+          context.source.domain);
+      if (!hit)
+        throw std::runtime_error(
+            "structured analytic triangle replacement was not intersected");
+      first = *hit;
+    } else {
+      if (context.options.backend ==
+          ShapeFactorBackend::structured_analytic)
+        throw std::runtime_error(
+            "structured analytic backend requires a triangle source "
+            "replacement");
+      first = context.geometry.intersect(
+          {context.source.position, sample.direction},
+          context.source.domain);
+    }
+  }
   // A non-convex boundary can contain triangles hidden behind the first
   // domain boundary.  They do not own any first-flight solid angle.  Mixed
   // visibility is resolved by the child comparison below.
@@ -893,7 +1501,7 @@ RowAccumulation evaluate_shape_factor_triangle(
        {weight, 0.0, 0.0, 0.0},
        shape_factor_reference_axis(sample.direction), context.source.domain, 0,
        first},
-      result);
+      result, context.structured_intersector);
   return result;
 }
 
@@ -908,10 +1516,6 @@ double projected_aperture_coverage(
       element.projected_aperture_hole_index == missing)
     throw std::runtime_error(
         "shape-factor element has an incomplete projected aperture");
-  if (element.coordinates !=
-      AnalyticSurfaceCoordinates::annulus_r2_phi)
-    throw std::runtime_error(
-        "projected aperture currently requires polar area cells");
   const auto& receiver = context.scene.mesh.analytic_primitives.at(
       element.primitive_index);
   const auto& aperture = context.scene.mesh.analytic_primitives.at(
@@ -948,6 +1552,14 @@ double projected_aperture_coverage(
   const Vec2 center = aperture_coordinates(element.center_mm);
   const double center_distance =
       std::hypot(center.x, center.y);
+  const double center_decision =
+      center_distance <= hole.radius_mm ? 1.0 : 0.0;
+  // Non-polar elements, notably aperture-tunnel cylinder panels, retain the
+  // same center-ray visibility decision as the generic first-hit path. Polar
+  // receiver cells additionally support finite-area edge coverage below.
+  if (element.coordinates !=
+      AnalyticSurfaceCoordinates::annulus_r2_phi)
+    return center_decision;
   const double radial_min =
       std::sqrt(std::max(0.0, element.bounds[0]));
   const double radial_max =
@@ -972,8 +1584,6 @@ double projected_aperture_coverage(
   const double uncertainty = std::abs(fraction) * cell_radius;
   if (center_distance + uncertainty <= hole.radius_mm) return 1.0;
   if (center_distance - uncertainty >= hole.radius_mm) return 0.0;
-  const double center_decision =
-      center_distance <= hole.radius_mm ? 1.0 : 0.0;
   if (unmasked_weight <
       context.options.aperture_edge_weight_threshold)
     return center_decision;
@@ -1034,8 +1644,58 @@ double projected_aperture_coverage(
   return std::clamp(covered_area / cell_area, 0.0, 1.0);
 }
 
-RowAccumulation evaluate_shape_factor_analytic_element(
-    const ShapeFactorTraceContext& context, std::uint32_t element_index) {
+bool accumulate_simple_structured_hit(
+    const ShapeFactorTraceContext& context, const Hit& hit,
+    const Vec3& direction, double weight, DenseRowAccumulator& output) {
+  if (weight <= context.scene.numerics.energy_tolerance) {
+    output.add_loss(3, weight);
+    return true;
+  }
+  const auto& surface = context.scene.surfaces.at(hit.surface_id);
+  if (surface.kind != SurfaceKind::lambertian &&
+      surface.kind != SurfaceKind::sensitive)
+    return false;
+  if (surface.kind == SurfaceKind::sensitive &&
+      surface.remainder != RemainderAction::absorb &&
+      surface.remainder != RemainderAction::reflect_lambertian)
+    return false;
+  const auto& medium = context.scene.media.at(context.source.domain);
+  const double survival =
+      std::isfinite(medium.absorption_length_mm)
+          ? std::exp(-hit.distance / medium.absorption_length_mm)
+          : 1.0;
+  output.add_loss(0, weight * (1.0 - survival));
+  const double incident = weight * survival;
+  const auto add_lambertian = [&](double value) {
+    if (!(value > 0.0)) return;
+    const auto state = context.primitive_to_state.find(hit.geometry_key);
+    if (state == context.primitive_to_state.end())
+      throw std::runtime_error(
+          "structured Lambertian hit has no geometry-owned state");
+    output.add_transition(state->second, value);
+  };
+  if (surface.kind == SurfaceKind::lambertian) {
+    add_lambertian(incident * surface.reflectivity);
+    output.add_loss(1, incident * (1.0 - surface.reflectivity));
+    return true;
+  }
+
+  const double detected = incident * surface.detection_probability;
+  output.add_detection(context.channel_to_column.at(hit.channel_id), detected);
+  const double remainder = incident - detected;
+  if (surface.remainder == RemainderAction::absorb)
+    output.add_loss(1, remainder);
+  else if (surface.remainder == RemainderAction::reflect_lambertian)
+    add_lambertian(remainder);
+  else
+    return false;
+  (void)direction;
+  return true;
+}
+
+void accumulate_shape_factor_analytic_element(
+    const ShapeFactorTraceContext& context, std::uint32_t element_index,
+    DenseRowAccumulator& output) {
   RowAccumulation result;
   const auto& element =
       context.scene.mesh.analytic_surface_elements.at(element_index);
@@ -1048,46 +1708,63 @@ RowAccumulation evaluate_shape_factor_analytic_element(
   const Vec3 direction = scale(displacement, 1.0 / distance);
   const double projected_cosine =
       std::max(0.0, dot(direction, element.normal));
-  if (!(projected_cosine > 0.0)) return result;
-  const auto expected_key =
-      analytic_surface_element_geometry_key(element_index);
-  Hit first = context.geometry.intersect(
-      {context.source.position, direction}, context.source.domain);
+  if (!(projected_cosine > 0.0)) return;
   const double unmasked_weight =
       context.source.stokes.i * projected_cosine * element.area_mm2 /
       (4.0 * pi * distance * distance);
   const double coverage = projected_aperture_coverage(
       context, element, unmasked_weight);
-  if (!(coverage > 0.0)) return result;
-  if (element.projected_aperture_primitive_index !=
-      std::numeric_limits<std::uint32_t>::max()) {
-    // The aperture can hide the center ray while exposing a finite fraction
-    // of the receiver cell.  Once the exact covered fraction is known, route
-    // that fraction to the receiver surface rather than the blocking plane.
+  if (!(coverage > 0.0)) return;
+  const auto expected_key =
+      analytic_surface_element_geometry_key(element_index);
+  const bool structured =
+      context.options.backend != ShapeFactorBackend::generic_bvh &&
+      element.source_visibility != AnalyticSourceVisibility::ray_traced;
+  const auto declared_hit = [&]() {
     const auto& primitive =
         context.scene.mesh.analytic_primitives.at(
             element.primitive_index);
-    first = {
-        true,
-        primitive.kind,
-        expected_key,
-        element.primitive_index,
-        primitive.surface_id,
-        distance,
-        element.normal,
-        primitive.minus_domain_id,
-        primitive.plus_domain_id,
-        primitive.channel_id,
-        element.surface_basis_id,
-        element.surface_element,
-        {1.0, 0.0, 0.0}};
-  } else if (!first.valid || first.geometry_key != expected_key) {
-    return result;
+    return Hit{true,
+               primitive.kind,
+               expected_key,
+               element.primitive_index,
+               primitive.surface_id,
+               distance,
+               element.normal,
+               primitive.minus_domain_id,
+               primitive.plus_domain_id,
+               primitive.channel_id,
+               element.surface_basis_id,
+               element.surface_element,
+               {1.0, 0.0, 0.0}};
+  };
+  Hit first;
+  if (structured) {
+    // The aperture can hide the center ray while exposing a finite fraction
+    // of the receiver cell.  Once the exact covered fraction is known, route
+    // that fraction to the receiver surface rather than the blocking plane.
+    first = declared_hit();
+  } else {
+    if (context.options.backend ==
+        ShapeFactorBackend::structured_analytic)
+      throw std::runtime_error(
+          "structured analytic backend requires an analytic-element "
+          "visibility declaration");
+    first = context.geometry.intersect(
+        {context.source.position, direction}, context.source.domain);
+    if (element.projected_aperture_primitive_index !=
+        std::numeric_limits<std::uint32_t>::max())
+      first = declared_hit();
+    else if (!first.valid || first.geometry_key != expected_key)
+      return;
   }
   const double weight = unmasked_weight * coverage;
   if (!(weight > 0.0) || !std::isfinite(weight))
     throw std::runtime_error(
         "analytic shape-factor element produced invalid weight");
+  if (structured && accumulate_simple_structured_hit(
+                        context, first, direction, weight, output))
+    return;
   trace_branch(
       context.scene, context.geometry, context.primitive_to_state,
       context.channel_to_column, context.custom_runtimes,
@@ -1097,8 +1774,134 @@ RowAccumulation evaluate_shape_factor_analytic_element(
        context.source.domain,
        0,
        first},
-      result);
-  return result;
+      result, context.structured_intersector);
+  output.add(result);
+}
+
+void accumulate_structured_disk_pass(
+    const ShapeFactorTraceContext& context, std::uint32_t primitive_index,
+    std::uint32_t mu_order, std::uint32_t phi_count,
+    DenseRowAccumulator& output,
+    DenseRowAccumulator* embedded_low = nullptr) {
+  const auto& primitive =
+      context.scene.mesh.analytic_primitives.at(primitive_index);
+  if (primitive.kind != GeometryPrimitiveKind::disk ||
+      primitive.source_integral !=
+          AnalyticSourceIntegral::directional_disk)
+    throw std::runtime_error(
+        "structured directional source integral requires a declared disk");
+  const Vec3 relative =
+      subtract(context.source.position, primitive.center_mm);
+  const double source_u = dot(relative, primitive.axis_x);
+  const double source_v = dot(relative, primitive.axis_y);
+  const double signed_height = dot(relative, primitive.axis_z);
+  const double height = std::abs(signed_height);
+  if (!(height > context.scene.numerics.geometry_tolerance_mm))
+    throw std::runtime_error(
+        "structured disk source lies in the receiver plane");
+  const double toward_plane = signed_height > 0.0 ? -1.0 : 1.0;
+  const double radius = primitive.parameters[0];
+  const double circle_constant =
+      source_u * source_u + source_v * source_v - radius * radius;
+  const bool embedded = embedded_low != nullptr;
+  if (embedded && (mu_order != 31 || phi_count % 2 != 0))
+    throw std::runtime_error(
+        "embedded structured disk rule requires order 31 and even phi count");
+  const auto mu_nodes = embedded
+                            ? std::vector<std::pair<double, double>>{}
+                            : gauss_legendre_unit_interval(mu_order);
+
+  for (std::uint32_t phi_index = 0; phi_index < phi_count;
+       ++phi_index) {
+    const double phi =
+        2.0 * pi *
+        (static_cast<double>(phi_index) + (embedded ? 0.0 : 0.5)) /
+        static_cast<double>(phi_count);
+    const double cosine = std::cos(phi);
+    const double sine = std::sin(phi);
+    const double projection = source_u * cosine + source_v * sine;
+    const double discriminant =
+        projection * projection - circle_constant;
+    if (!(discriminant > 0.0)) continue;
+    const double root = std::sqrt(discriminant);
+    const double radial_min = std::max(0.0, -projection - root);
+    const double radial_max = -projection + root;
+    if (!(radial_max > radial_min)) continue;
+    const double mu_min =
+        height / std::hypot(height, radial_max);
+    const double mu_max =
+        height / std::hypot(height, radial_min);
+    if (!(mu_max > mu_min)) continue;
+    const Vec3 radial_direction =
+        add(scale(primitive.axis_x, cosine),
+            scale(primitive.axis_y, sine));
+    const auto trace_node = [&](double unit_mu, double unit_weight,
+                                double embedded_weight) {
+      const double mu = mu_min + (mu_max - mu_min) * unit_mu;
+      const double transverse =
+          std::sqrt(std::max(0.0, 1.0 - mu * mu));
+      const Vec3 direction =
+          add(scale(radial_direction, transverse),
+              scale(primitive.axis_z, toward_plane * mu));
+      const double weight =
+          context.source.stokes.i * (mu_max - mu_min) * unit_weight /
+          (2.0 * static_cast<double>(phi_count));
+      const auto first = context.geometry.intersect_declared_analytic(
+          primitive_index, {context.source.position, direction},
+          context.source.domain);
+      if (!first)
+        throw std::runtime_error(
+            "structured disk quadrature did not intersect its receiver");
+      RowAccumulation node;
+      trace_branch(
+          context.scene, context.geometry, context.primitive_to_state,
+          context.channel_to_column, context.custom_runtimes,
+          {{context.source.position, direction},
+           {weight, 0.0, 0.0, 0.0},
+           shape_factor_reference_axis(direction), context.source.domain, 0,
+           *first},
+          node, context.structured_intersector);
+      output.add(node);
+      if (embedded_low && embedded_weight > 0.0 &&
+          phi_index % 2u == 0u)
+        embedded_low->add(
+            node, 2.0 * embedded_weight / unit_weight);
+    };
+    if (embedded) {
+      for (const auto& node : gauss_kronrod_15_31_unit_interval())
+        trace_node(node.unit_node, node.high_weight, node.low_weight);
+    } else {
+      for (const auto& [unit_mu, unit_weight] : mu_nodes)
+        trace_node(unit_mu, unit_weight, 0.0);
+    }
+  }
+}
+
+double accumulate_structured_disk(
+    const ShapeFactorTraceContext& context, std::uint32_t primitive_index,
+    std::size_t transition_count, std::size_t detection_count,
+    std::size_t loss_count, DenseRowAccumulator& output) {
+  DenseRowAccumulator high;
+  high.reset(transition_count, detection_count, loss_count);
+  DenseRowAccumulator low;
+  low.reset(transition_count, detection_count, loss_count);
+  if (context.options.structured_disk_mu_order == 31 &&
+      context.options.structured_disk_phi_count % 2u == 0u) {
+    accumulate_structured_disk_pass(
+        context, primitive_index, 31,
+        context.options.structured_disk_phi_count, high, &low);
+  } else {
+    accumulate_structured_disk_pass(
+        context, primitive_index, context.options.structured_disk_mu_order,
+        context.options.structured_disk_phi_count, high);
+    accumulate_structured_disk_pass(
+        context, primitive_index,
+        std::max(1u, context.options.structured_disk_mu_order / 2u),
+        std::max(1u, context.options.structured_disk_phi_count / 2u), low);
+  }
+  const double error = high.l1_difference(low);
+  output.add(high);
+  return error;
 }
 
 struct ShapeFactorAssessment {
@@ -1189,15 +1992,19 @@ ShapeFactorIntegral integrate_shape_factor_triangle(
   return result;
 }
 
-ShapeFactorIntegral trace_shape_factor_point(
+double trace_shape_factor_point(
     const Scene& scene, const Geometry& geometry,
     const std::unordered_map<std::uint64_t, std::uint32_t>&
         primitive_to_state,
     const std::unordered_map<std::int32_t, std::uint32_t>&
         channel_to_column,
     const CustomRuntimeMap& custom_runtimes,
+    const StructuredAnalyticIntersector* structured_intersector,
     const ShapeFactorFeatureEdges& feature_edges,
-    const SourcePoint& source, const ShapeFactorOptions& options) {
+    const ShapeFactorDomainCandidates& domain_candidates,
+    const SourcePoint& source, const ShapeFactorOptions& options,
+    std::size_t transition_count, std::size_t detection_count,
+    std::size_t loss_count, DenseRowAccumulator& output) {
   if (std::abs(source.stokes.q) > scene.numerics.energy_tolerance ||
       std::abs(source.stokes.u) > scene.numerics.energy_tolerance ||
       std::abs(source.stokes.v) > scene.numerics.energy_tolerance)
@@ -1209,52 +2016,42 @@ ShapeFactorIntegral trace_shape_factor_point(
 
   ShapeFactorTraceContext context{
       scene, geometry, primitive_to_state, channel_to_column,
-      custom_runtimes, source, options};
+      custom_runtimes, structured_intersector, source, options};
   std::vector<std::uint32_t> boundary_primitives;
-  boundary_primitives.reserve(scene.mesh.triangles.size());
-  for (std::uint32_t primitive = 0;
-       primitive < scene.mesh.triangles.size(); ++primitive) {
-    const auto minus = scene.mesh.minus_domain_id.at(primitive);
-    const auto plus = scene.mesh.plus_domain_id.at(primitive);
-    if (source.domain != minus && source.domain != plus) continue;
-    const bool source_quadrature =
-        scene.mesh.triangle_source_quadrature.empty()
-            ? (scene.mesh.triangle_transport.empty() ||
-               scene.mesh.triangle_transport.at(primitive) != 0)
-            : scene.mesh.triangle_source_quadrature.at(primitive) != 0;
-    if (!source_quadrature)
+  boundary_primitives.reserve(domain_candidates.triangles.size());
+  std::vector<std::uint32_t> structured_integrals;
+  for (const auto& candidate : domain_candidates.triangles) {
+    if (dot(subtract(candidate.center, source.position),
+            candidate.outward) <= 0.0)
       continue;
-    const auto indices = scene.mesh.triangles.at(primitive);
-    const Vec3 center =
-        scale(add(add(scene.mesh.vertices.at(indices[0]),
-                      scene.mesh.vertices.at(indices[1])),
-                  scene.mesh.vertices.at(indices[2])),
-              1.0 / 3.0);
-    const Vec3 geometric_normal = triangle_normal(scene, primitive);
-    const Vec3 outward =
-        source.domain == minus ? geometric_normal
-                               : scale(geometric_normal, -1.0);
-    if (dot(subtract(center, source.position), outward) > 0.0)
-      boundary_primitives.push_back(primitive);
+    const auto missing = std::numeric_limits<std::uint32_t>::max();
+    const auto replacement =
+        scene.mesh.triangle_source_analytic_primitive.empty()
+            ? missing
+            : scene.mesh.triangle_source_analytic_primitive.at(
+                  candidate.index);
+    if (options.backend != ShapeFactorBackend::generic_bvh &&
+        replacement != missing &&
+        scene.mesh.analytic_primitives.at(replacement).source_integral !=
+            AnalyticSourceIntegral::none) {
+      if (std::find(structured_integrals.begin(),
+                    structured_integrals.end(), replacement) ==
+          structured_integrals.end())
+        structured_integrals.push_back(replacement);
+      continue;
+    }
+    boundary_primitives.push_back(candidate.index);
   }
   std::vector<std::uint32_t> analytic_elements;
-  analytic_elements.reserve(scene.mesh.analytic_surface_elements.size());
-  for (std::uint32_t index = 0;
-       index < scene.mesh.analytic_surface_elements.size(); ++index) {
-    const auto& element =
-        scene.mesh.analytic_surface_elements.at(index);
-    if (!element.source_quadrature) continue;
-    const auto& primitive =
-        scene.mesh.analytic_primitives.at(element.primitive_index);
-    if (source.domain != primitive.minus_domain_id &&
-        source.domain != primitive.plus_domain_id)
-      continue;
-    if (dot(subtract(element.center_mm, source.position),
-            element.normal) > 0.0)
-      analytic_elements.push_back(index);
+  analytic_elements.reserve(domain_candidates.analytic_elements.size());
+  for (const auto& candidate : domain_candidates.analytic_elements) {
+    if (dot(subtract(candidate.center, source.position),
+            candidate.outward) > 0.0)
+      analytic_elements.push_back(candidate.index);
   }
   const std::size_t boundary_count =
-      boundary_primitives.size() + analytic_elements.size();
+      boundary_primitives.size() + analytic_elements.size() +
+      structured_integrals.size();
   if (boundary_count == 0)
     throw std::runtime_error(
         "shape-factor source has no outward-facing domain boundary");
@@ -1266,15 +2063,17 @@ ShapeFactorIntegral trace_shape_factor_point(
       scene.numerics.energy_tolerance * source.stokes.i /
       boundary_count;
 
-  RowAccumulation result;
+  DenseRowAccumulator dense_result;
+  dense_result.reset(transition_count, detection_count, loss_count);
   double estimated_l1_error = 0.0;
   std::exception_ptr error;
 #pragma omp parallel
   {
-    RowAccumulation local;
+    thread_local DenseRowAccumulator local;
+    local.reset(transition_count, detection_count, loss_count);
     double local_estimated_l1_error = 0.0;
     std::exception_ptr local_error;
-#pragma omp for schedule(dynamic, 1)
+#pragma omp for schedule(dynamic, 8)
     for (std::int64_t boundary_index = 0;
          boundary_index <
          static_cast<std::int64_t>(boundary_count);
@@ -1282,12 +2081,24 @@ ShapeFactorIntegral trace_shape_factor_point(
       if (local_error) continue;
       try {
         if (boundary_index >=
+            static_cast<std::int64_t>(boundary_primitives.size() +
+                                      analytic_elements.size())) {
+          const auto structured_index =
+              structured_integrals[boundary_index -
+                                   boundary_primitives.size() -
+                                   analytic_elements.size()];
+          local_estimated_l1_error += accumulate_structured_disk(
+              context, structured_index, transition_count, detection_count,
+              loss_count, local);
+          continue;
+        }
+        if (boundary_index >=
             static_cast<std::int64_t>(boundary_primitives.size())) {
           const auto analytic_index =
               analytic_elements[boundary_index -
                                 boundary_primitives.size()];
-          add_row(local, evaluate_shape_factor_analytic_element(
-                             context, analytic_index));
+          accumulate_shape_factor_analytic_element(
+              context, analytic_index, local);
           continue;
         }
         const auto primitive = boundary_primitives[boundary_index];
@@ -1300,7 +2111,7 @@ ShapeFactorIntegral trace_shape_factor_point(
         auto integrated = integrate_shape_factor_triangle(
             context, triangle, primitive_error_budget,
             primitive_numerical_error_floor);
-        add_row(local, integrated.row);
+        local.add(integrated.row);
         local_estimated_l1_error += integrated.estimated_l1_error;
       } catch (...) {
         local_error = std::current_exception();
@@ -1308,13 +2119,13 @@ ShapeFactorIntegral trace_shape_factor_point(
     }
 #pragma omp critical(oos_shape_factor_merge)
     {
-      add_row(result, local);
+      dense_result.add(local);
       estimated_l1_error += local_estimated_l1_error;
       if (local_error && !error) error = local_error;
     }
   }
   if (error) std::rethrow_exception(error);
-  const double accounted = row_total(result);
+  const double accounted = dense_result.total();
   if (!(accounted > 0.0) || !std::isfinite(accounted))
     throw std::runtime_error(
         "shape-factor source produced no finite boundary weight");
@@ -1323,8 +2134,9 @@ ShapeFactorIntegral trace_shape_factor_point(
   // small solid-angle region. Deterministic source quadratures are normalized
   // by contract; include the normalization correction in the L1 error audit.
   estimated_l1_error += std::abs(accounted - source.stokes.i);
-  scale_row(result, source.stokes.i / accounted);
-  return {std::move(result), estimated_l1_error};
+  dense_result.scale_values(source.stokes.i / accounted);
+  output.add(dense_result);
+  return estimated_l1_error;
 }
 
 CsrMatrix maps_to_csr(
@@ -1777,6 +2589,115 @@ CustomRuntimeMap create_custom_runtimes(const Scene& scene,
 
 }  // namespace
 
+struct SourceTraceRuntime::Impl {
+  const Scene& scene;
+  const OperatorSet& operators;
+  Geometry geometry;
+  StructuredAnalyticIntersector structured_geometry;
+  LocalSurfaceBasis local_basis;
+  CustomRuntimeMap custom_runtimes;
+  std::unordered_map<std::int32_t, std::uint32_t> channel_to_column;
+  std::unordered_map<std::int32_t, ShapeFactorDomainCandidates>
+      domain_candidates;
+  mutable std::map<double, ShapeFactorFeatureEdges> feature_edge_cache;
+  mutable std::mutex feature_edge_mutex;
+
+  Impl(const Scene& scene_value, const OperatorSet& operator_value)
+      : scene(scene_value),
+        operators(operator_value),
+        geometry(scene_value),
+        structured_geometry(scene_value, geometry),
+        local_basis(make_local_surface_basis(scene_value)),
+        custom_runtimes(create_custom_runtimes(
+            scene_value,
+            static_cast<std::uint32_t>(local_basis.state_emitters.size()))) {
+    if (operators.ray_origin_offset_mm > 0.0 &&
+        std::abs(geometry.ray_origin_offset_mm() -
+                 operators.ray_origin_offset_mm) >
+            scene.numerics.energy_tolerance)
+      throw std::runtime_error(
+          "scene ray-origin offset does not match the operator cache");
+
+    std::uint64_t expected_states = local_basis.state_emitters.size();
+    for (const auto& [surface_id, runtime] : custom_runtimes) {
+      (void)surface_id;
+      expected_states = std::max(
+          expected_states, runtime.state_offset + runtime.state_count);
+    }
+    if (expected_states != operators.transition.rows)
+      throw std::runtime_error("scene states do not match operator cache");
+    for (std::uint32_t column = 0;
+         column < operators.channel_ids.size(); ++column)
+      channel_to_column[operators.channel_ids[column]] = column;
+
+    // Build domain-adjacent source-boundary structure-of-arrays once. The
+    // source-dependent facing test below then touches only compact candidates
+    // instead of rescanning and rebuilding normals for the complete mesh.
+    for (std::uint32_t primitive = 0;
+         primitive < scene.mesh.triangles.size(); ++primitive) {
+      const bool source_quadrature =
+          scene.mesh.triangle_source_quadrature.empty()
+              ? (scene.mesh.triangle_transport.empty() ||
+                 scene.mesh.triangle_transport.at(primitive) != 0)
+              : scene.mesh.triangle_source_quadrature.at(primitive) != 0;
+      if (!source_quadrature) continue;
+      const Vec3 center = triangle_center(scene, primitive);
+      const Vec3 normal = triangle_normal(scene, primitive);
+      const auto minus = scene.mesh.minus_domain_id.at(primitive);
+      const auto plus = scene.mesh.plus_domain_id.at(primitive);
+      if (scene.media.count(minus))
+        domain_candidates[minus].triangles.push_back(
+            {primitive, center, normal});
+      if (plus != minus && scene.media.count(plus))
+        domain_candidates[plus].triangles.push_back(
+            {primitive, center, scale(normal, -1.0)});
+    }
+    for (std::uint32_t index = 0;
+         index < scene.mesh.analytic_surface_elements.size(); ++index) {
+      const auto& element =
+          scene.mesh.analytic_surface_elements.at(index);
+      if (!element.source_quadrature) continue;
+      const auto& primitive =
+          scene.mesh.analytic_primitives.at(element.primitive_index);
+      if (scene.media.count(primitive.minus_domain_id))
+        domain_candidates[primitive.minus_domain_id]
+            .analytic_elements.push_back(
+                {index, element.center_mm, element.normal});
+      if (primitive.plus_domain_id != primitive.minus_domain_id &&
+          scene.media.count(primitive.plus_domain_id))
+        domain_candidates[primitive.plus_domain_id]
+            .analytic_elements.push_back(
+                {index, element.center_mm, element.normal});
+    }
+  }
+
+  const ShapeFactorFeatureEdges& feature_edges(double dihedral) const {
+    std::lock_guard<std::mutex> lock(feature_edge_mutex);
+    auto found = feature_edge_cache.find(dihedral);
+    if (found == feature_edge_cache.end())
+      found = feature_edge_cache
+                  .emplace(dihedral, build_shape_factor_feature_edges(
+                                         scene, dihedral))
+                  .first;
+    return found->second;
+  }
+};
+
+SourceTraceRuntime::SourceTraceRuntime(
+    const Scene& scene, const OperatorSet& operators) {
+  // Validation is intentionally once per runtime rather than once per
+  // coordinate/batch call; for production operator sets this is a measurable
+  // full sparse-matrix traversal.
+  operators.validate();
+  impl_ = std::make_unique<Impl>(scene, operators);
+}
+
+SourceTraceRuntime::~SourceTraceRuntime() = default;
+SourceTraceRuntime::SourceTraceRuntime(SourceTraceRuntime&&) noexcept =
+    default;
+SourceTraceRuntime& SourceTraceRuntime::operator=(
+    SourceTraceRuntime&&) noexcept = default;
+
 std::string OperatorBuilder::cache_key(const Scene& scene) {
   OperatorSet provenance;
   apply_provenance(provenance, scene);
@@ -1916,9 +2837,9 @@ OperatorSet OperatorBuilder::build(const Scene& scene) {
           }
         }
       }
-      transition_rows[state] = std::move(row.transition);
-      detection_rows[state] = std::move(row.detection);
-      loss_rows[state] = std::move(row.losses);
+      transition_rows[state] = ordered_map(row.transition);
+      detection_rows[state] = ordered_map(row.detection);
+      loss_rows[state] = ordered_map(row.losses);
     } catch (...) {
 #pragma omp critical(oos_local_state_build_error)
       {
@@ -1960,9 +2881,9 @@ OperatorSet OperatorBuilder::build(const Scene& scene) {
       std::vector<std::map<std::uint32_t, double>> to_losses(
           egress.size());
       for (std::size_t index = 0; index < egress.size(); ++index) {
-        to_transition[index] = std::move(egress_rows[index].transition);
-        to_detection[index] = std::move(egress_rows[index].detection);
-        to_losses[index] = std::move(egress_rows[index].losses);
+        to_transition[index] = ordered_map(egress_rows[index].transition);
+        to_detection[index] = ordered_map(egress_rows[index].detection);
+        to_losses[index] = ordered_map(egress_rows[index].losses);
       }
       FunctionBlock block;
       block.name = scene.surfaces.at(surface_id).name;
@@ -2037,32 +2958,15 @@ OperatorSet OperatorBuilder::build(const Scene& scene) {
   return result;
 }
 
-SourceBatch trace_source_quadratures(
-    const Scene& scene, const OperatorSet& operators,
-    const std::vector<SourceQuadrature>& quadratures) {
-  operators.validate();
-  Geometry geometry(scene);
-  if (operators.ray_origin_offset_mm > 0.0 &&
-      std::abs(geometry.ray_origin_offset_mm() -
-               operators.ray_origin_offset_mm) >
-          scene.numerics.energy_tolerance)
-    throw std::runtime_error(
-        "scene ray-origin offset does not match the operator cache");
-  const auto local_basis = make_local_surface_basis(scene);
-  const auto& primitive_to_state = local_basis.primitive_to_state;
-  const std::uint32_t state = local_basis.state_emitters.size();
-  const auto custom_runtimes = create_custom_runtimes(scene, state);
-  std::uint64_t expected_states = state;
-  for (const auto& [surface_id, runtime] : custom_runtimes) {
-    (void)surface_id;
-    expected_states =
-        std::max(expected_states, runtime.state_offset + runtime.state_count);
-  }
-  if (expected_states != operators.transition.rows)
-    throw std::runtime_error("scene states do not match operator cache");
-  std::unordered_map<std::int32_t, std::uint32_t> channel_to_column;
-  for (std::uint32_t i = 0; i < operators.channel_ids.size(); ++i)
-    channel_to_column[operators.channel_ids[i]] = i;
+SourceBatch SourceTraceRuntime::trace(
+    const std::vector<SourceQuadrature>& quadratures) const {
+  const auto& scene = impl_->scene;
+  const auto& operators = impl_->operators;
+  const auto& geometry = impl_->geometry;
+  const auto& primitive_to_state =
+      impl_->local_basis.primitive_to_state;
+  const auto& custom_runtimes = impl_->custom_runtimes;
+  const auto& channel_to_column = impl_->channel_to_column;
 
   SourceBatch result;
   result.count = quadratures.size();
@@ -2096,19 +3000,31 @@ SourceBatch trace_source_quadratures(
         SourceIntegration::isotropic_surface_shape_factor)
       continue;
     RowAccumulation row;
+    std::vector<Ray> root_rays;
+    std::vector<std::int32_t> root_domains;
+    root_rays.reserve(quadratures[index].rays.size());
+    root_domains.reserve(quadratures[index].rays.size());
     for (const auto& source_ray : quadratures[index].rays) {
+      root_rays.push_back(source_ray.ray);
+      root_domains.push_back(source_ray.domain);
+    }
+    const auto root_hits =
+        geometry.intersect_batch(root_rays, root_domains);
+    for (std::size_t ray_index = 0;
+         ray_index < quadratures[index].rays.size(); ++ray_index) {
+      const auto& source_ray = quadratures[index].rays[ray_index];
       trace_branch(
           scene, geometry, primitive_to_state, channel_to_column,
           custom_runtimes,
           {source_ray.ray, source_ray.stokes, source_ray.reference_axis,
-           source_ray.domain, 0, std::nullopt},
+           source_ray.domain, 0, root_hits[ray_index]},
           row);
     }
     store_row(static_cast<std::size_t>(index), row);
   }
 
   std::vector<std::size_t> shape_factor_indices;
-  std::map<double, ShapeFactorFeatureEdges> feature_edge_cache;
+  std::map<double, const ShapeFactorFeatureEdges*> feature_edges;
   for (std::size_t index = 0; index < quadratures.size(); ++index) {
     if (quadratures[index].integration !=
         SourceIntegration::isotropic_surface_shape_factor)
@@ -2119,37 +3035,52 @@ SourceBatch trace_source_quadratures(
           "shape-factor source has no spatial quadrature points");
     const double dihedral =
         quadratures[index].shape_factor.feature_dihedral_degrees;
-    auto found_features = feature_edge_cache.find(dihedral);
-    if (found_features == feature_edge_cache.end())
-      found_features =
-          feature_edge_cache
-              .emplace(dihedral,
-                       build_shape_factor_feature_edges(scene, dihedral))
-              .first;
+    if (!feature_edges.count(dihedral))
+      feature_edges.emplace(dihedral, &impl_->feature_edges(dihedral));
   }
 
   const auto trace_shape_factor_quadrature =
       [&](std::size_t index) {
-    RowAccumulation row;
+    thread_local DenseRowAccumulator row;
+    row.reset(operators.transition.rows, operators.detection.cols,
+              operators.losses.cols);
     double estimated_l1_error = 0.0;
-    const auto& feature_edges = feature_edge_cache.at(
+    const auto& point_feature_edges = *feature_edges.at(
         quadratures[index].shape_factor.feature_dihedral_degrees);
     for (const auto& source_point : quadratures[index].points) {
-      auto integrated = trace_shape_factor_point(
+      const auto candidates =
+          impl_->domain_candidates.find(source_point.domain);
+      if (candidates == impl_->domain_candidates.end())
+        throw std::runtime_error(
+            "shape-factor source domain has no boundary candidates");
+      estimated_l1_error += trace_shape_factor_point(
           scene, geometry, primitive_to_state, channel_to_column,
-          custom_runtimes, feature_edges, source_point,
-          quadratures[index].shape_factor);
-      add_row(row, integrated.row);
-      estimated_l1_error += integrated.estimated_l1_error;
+          custom_runtimes,
+          quadratures[index].shape_factor.backend ==
+                  ShapeFactorBackend::generic_bvh
+              ? nullptr
+              : &impl_->structured_geometry,
+          point_feature_edges, candidates->second,
+          source_point,
+          quadratures[index].shape_factor,
+          operators.transition.rows, operators.detection.cols,
+          operators.losses.cols, row);
     }
     result.source_integration_l1_error_estimate[index] = estimated_l1_error;
-    store_row(index, row);
+    row.store_to(result, index, operators.transition.rows,
+                 operators.detection.cols, operators.losses.cols);
   };
 
-  if (shape_factor_indices.size() == 1) {
-    // Preserve the lower-latency single-source path: the integration routine
-    // parallelizes over boundary triangles.
-    trace_shape_factor_quadrature(shape_factor_indices.front());
+  std::size_t worker_count = 1;
+#ifdef _OPENMP
+  worker_count = static_cast<std::size_t>(omp_get_max_threads());
+#endif
+  if (!shape_factor_indices.empty() &&
+      shape_factor_indices.size() < worker_count) {
+    // Small batches are faster source-by-source because each source can use
+    // the complete worker pool for its much larger boundary-element loop.
+    for (const auto index : shape_factor_indices)
+      trace_shape_factor_quadrature(index);
   } else if (!shape_factor_indices.empty()) {
     // Likelihood searches submit many independent candidate coordinates.
     // Parallelize those candidates at the outer level; nested OpenMP regions

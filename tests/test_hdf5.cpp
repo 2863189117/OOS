@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <limits>
 
 #include "oos/hdf5_io.hpp"
 
@@ -16,6 +17,10 @@ TEST_CASE("geometry HDF5 preserves an independent surface basis") {
   mesh.channel_id.assign(4, -1);
   mesh.triangle_transport = {1, 0, 1, 0};
   mesh.triangle_source_quadrature = {1, 1, 0, 0};
+  mesh.triangle_source_analytic_primitive = {
+      0, std::numeric_limits<std::uint32_t>::max(),
+      std::numeric_limits<std::uint32_t>::max(),
+      std::numeric_limits<std::uint32_t>::max()};
   oos::AnalyticPrimitive box;
   box.kind = oos::GeometryPrimitiveKind::box;
   box.center_mm = {1, 2, 3};
@@ -26,6 +31,7 @@ TEST_CASE("geometry HDF5 preserves an independent surface basis") {
   box.plus_domain_id = -1;
   box.channel_id = -1;
   box.surface_element = 23;
+  box.source_integral = oos::AnalyticSourceIntegral::directional_disk;
   mesh.analytic_primitives.push_back(box);
   oos::AnalyticSurfaceElement element;
   element.primitive_index = 0;
@@ -36,6 +42,7 @@ TEST_CASE("geometry HDF5 preserves an independent surface basis") {
   element.area_mm2 = 120.0;
   element.surface_basis_id = 17;
   element.surface_element = 9;
+  element.source_visibility = oos::AnalyticSourceVisibility::direct;
   element.projected_aperture_primitive_index = 0;
   element.projected_aperture_hole_index = 3;
   mesh.analytic_surface_elements.push_back(element);
@@ -48,16 +55,22 @@ TEST_CASE("geometry HDF5 preserves an independent surface basis") {
   REQUIRE(restored.triangle_transport == mesh.triangle_transport);
   REQUIRE(restored.triangle_source_quadrature ==
           mesh.triangle_source_quadrature);
+  REQUIRE(restored.triangle_source_analytic_primitive ==
+          mesh.triangle_source_analytic_primitive);
   REQUIRE(restored.analytic_primitives.size() == 1);
   REQUIRE(restored.analytic_primitives[0].kind ==
           oos::GeometryPrimitiveKind::box);
   REQUIRE(restored.analytic_primitives[0].parameters[2] == 6.0);
   REQUIRE(restored.analytic_primitives[0].surface_element == 23);
+  REQUIRE(restored.analytic_primitives[0].source_integral ==
+          oos::AnalyticSourceIntegral::directional_disk);
   REQUIRE(restored.analytic_surface_elements.size() == 1);
   REQUIRE(restored.analytic_surface_elements[0].coordinates ==
           oos::AnalyticSurfaceCoordinates::box_face_uv);
   REQUIRE(restored.analytic_surface_elements[0].area_mm2 == 120.0);
   REQUIRE(restored.analytic_surface_elements[0].surface_basis_id == 17);
+  REQUIRE(restored.analytic_surface_elements[0].source_visibility ==
+          oos::AnalyticSourceVisibility::direct);
   REQUIRE(restored.analytic_surface_elements[0]
               .projected_aperture_primitive_index == 0);
   REQUIRE(restored.analytic_surface_elements[0]

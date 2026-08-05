@@ -1,11 +1,15 @@
 #include "oos/regression.hpp"
 
+#include "oos/hash.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <numeric>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -64,6 +68,38 @@ Vec3 reference_axis(const Vec3& direction) {
 
 }  // namespace
 
+std::string response_grid_fingerprint(const ResponseGrid& grid) {
+  std::ostringstream material;
+  material << "oos.response-grid.semantic.v2\n"
+           << grid.effective_response_fingerprint_sha256 << '\n'
+           << grid.domain_shape << '\n'
+           << std::setprecision(17) << grid.radius_mm << '\n'
+           << grid.half_x_mm << '\n'
+           << grid.half_y_mm << '\n'
+           << grid.line_y_start_mm << '\n'
+           << grid.line_pitch_mm << '\n'
+           << grid.line_count << '\n'
+           << grid.spacing_mm << '\n'
+           << grid.points << '\n'
+           << grid.channels << '\n'
+           << grid.source_angular_mode << '\n'
+           << grid.source_backend << '\n'
+           << grid.source_z_mm << '\n'
+           << grid.source_thickness_mm << '\n'
+           << grid.source_transverse_count << '\n'
+           << grid.obstacle_half_width_mm << '\n'
+           << grid.obstacle_half_thickness_mm << '\n'
+           << grid.source_medium_z_max_mm << '\n'
+           << grid.source_mu_order << '\n'
+           << grid.source_phi_count << '\n'
+           << grid.source_relative_tolerance << '\n'
+           << grid.source_maximum_subdivision_depth << '\n'
+           << grid.structured_disk_mu_order << '\n'
+           << grid.structured_disk_phi_count;
+  for (const auto channel : grid.channel_ids) material << '\n' << channel;
+  return sha256_string(material.str());
+}
+
 void ResponseGrid::validate() const {
   const bool valid_domain =
       domain_shape == "disk"
@@ -73,10 +109,15 @@ void ResponseGrid::validate() const {
                 : domain_shape == "parallel_lines" && half_x_mm > 0.0 &&
                       std::isfinite(line_y_start_mm) &&
                       line_pitch_mm > 0.0 && line_count > 0;
+  const bool valid_backend =
+      source_backend == "auto" || source_backend == "generic_bvh" ||
+      source_backend == "structured_analytic";
   if (!valid_domain || !(spacing_mm > 0.0) || points == 0 ||
       channels == 0 || xy_mm.size() != points * 2 ||
       conditional_log_probability.size() != points * channels ||
-      top_efficiency.size() != points || channel_ids.size() != channels)
+      top_efficiency.size() != points || channel_ids.size() != channels ||
+      !valid_backend || !(source_relative_tolerance > 0.0) ||
+      structured_disk_mu_order < 2 || structured_disk_phi_count < 2)
     throw std::runtime_error("response grid dimensions are invalid");
   if (!std::all_of(
           conditional_log_probability.begin(),

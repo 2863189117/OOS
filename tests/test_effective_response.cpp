@@ -132,6 +132,8 @@ TEST_CASE("effective response HDF5 round trip preserves its contract") {
   REQUIRE(restored.state_unresolved == value.state_unresolved);
   REQUIRE(restored.operator_cache_key_sha256 ==
           value.operator_cache_key_sha256);
+  REQUIRE(restored.fingerprint_sha256 ==
+          oos::effective_response_fingerprint(value));
 
   const std::string obsolete_schema =
       "oos.effective-bounded-response.v1";

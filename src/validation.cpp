@@ -116,7 +116,43 @@ ValidationReport SceneValidator::validate(const Scene& scene) {
   if (!scene.mesh.triangle_source_quadrature.empty())
     check_count(scene.mesh.triangle_source_quadrature.size(),
                 "triangle_source_quadrature");
+  if (!scene.mesh.triangle_source_analytic_primitive.empty())
+    check_count(scene.mesh.triangle_source_analytic_primitive.size(),
+                "triangle_source_analytic_primitive");
   if (!report.ok()) return report;
+
+  std::vector<std::size_t> source_replacement_count(
+      scene.mesh.analytic_primitives.size(), 0);
+  if (!scene.mesh.triangle_source_analytic_primitive.empty()) {
+    const auto missing = std::numeric_limits<std::uint32_t>::max();
+    for (std::uint32_t triangle = 0; triangle < triangle_count; ++triangle) {
+      const auto replacement =
+          scene.mesh.triangle_source_analytic_primitive[triangle];
+      if (replacement == missing) continue;
+      if (replacement >= scene.mesh.analytic_primitives.size()) {
+        error(report, "analytic_source_quadrature",
+              "triangle source replacement references an unknown analytic "
+              "primitive");
+        continue;
+      }
+      ++source_replacement_count[replacement];
+      if (!scene.mesh.triangle_source_quadrature.empty() &&
+          !scene.mesh.triangle_source_quadrature[triangle])
+        error(report, "analytic_source_quadrature",
+              "triangle source replacement is declared for a disabled "
+              "source-quadrature triangle");
+      const auto& replacement_primitive =
+          scene.mesh.analytic_primitives[replacement];
+      if (replacement_primitive.surface_id !=
+              scene.mesh.surface_id[triangle] ||
+          replacement_primitive.minus_domain_id !=
+              scene.mesh.minus_domain_id[triangle] ||
+          replacement_primitive.plus_domain_id !=
+              scene.mesh.plus_domain_id[triangle])
+        error(report, "analytic_source_quadrature",
+              "triangle source replacement surface or domains do not match");
+    }
+  }
 
   std::set<std::array<std::uint32_t, 3>> unique_triangles;
   std::map<std::pair<std::int32_t, Edge>, int> directed_domain_edges;
@@ -301,7 +337,11 @@ ValidationReport SceneValidator::validate(const Scene& scene) {
       }
     }
   }
-  for (const auto& primitive : scene.mesh.analytic_primitives) {
+  for (std::size_t primitive_index = 0;
+       primitive_index < scene.mesh.analytic_primitives.size();
+       ++primitive_index) {
+    const auto& primitive =
+        scene.mesh.analytic_primitives[primitive_index];
     try {
       validate_analytic_primitive(
           primitive,
@@ -336,6 +376,16 @@ ValidationReport SceneValidator::validate(const Scene& scene) {
         primitive.channel_id >= 0)
       error(report, "unexpected_channel",
             "non-sensitive analytic primitive has channel_id");
+    if (primitive.source_integral ==
+        AnalyticSourceIntegral::directional_disk) {
+      if (primitive.kind != GeometryPrimitiveKind::disk)
+        error(report, "analytic_source_quadrature",
+              "directional source integration requires a disk primitive");
+      if (source_replacement_count[primitive_index] == 0)
+        error(report, "analytic_source_quadrature",
+              "directional source integration requires mapped source "
+              "triangles");
+    }
   }
   for (const auto& element : scene.mesh.analytic_surface_elements) {
     if (element.primitive_index >= scene.mesh.analytic_primitives.size()) {
@@ -386,6 +436,9 @@ ValidationReport SceneValidator::validate(const Scene& scene) {
         element.projected_aperture_primitive_index != missing;
     const bool has_aperture_hole =
         element.projected_aperture_hole_index != missing;
+    const bool structured_aperture =
+        element.source_visibility ==
+        AnalyticSourceVisibility::projected_aperture;
     if (has_aperture_primitive != has_aperture_hole) {
       error(report, "analytic_source_quadrature",
             "analytic surface element has an incomplete projected aperture");
@@ -406,6 +459,9 @@ ValidationReport SceneValidator::validate(const Scene& scene) {
                 "projected aperture hole index is out of range");
       }
     }
+    if (structured_aperture && !has_aperture_primitive)
+      error(report, "analytic_source_quadrature",
+            "structured projected-aperture visibility requires an aperture");
   }
   if (!report.ok()) return report;
 

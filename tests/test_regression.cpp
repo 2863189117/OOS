@@ -80,6 +80,14 @@ TEST_CASE("conditional grid likelihood selects the matching response") {
   const std::vector<double> efficiency{0.18, 0.02, 0.02, 0.18};
   auto grid = oos::make_response_grid(xy, efficiency, 2, {10, 11}, 2.0,
                                       2.0, 1.0e-15, "rectangle", 1.0, 0.5);
+  grid.effective_response_fingerprint_sha256 = "effective-fingerprint";
+  grid.source_angular_mode = "shape_factor";
+  grid.source_backend = "structured_analytic";
+  grid.source_relative_tolerance = 2.0e-5;
+  grid.source_maximum_subdivision_depth = 6;
+  grid.structured_disk_mu_order = 31;
+  grid.structured_disk_phi_count = 72;
+  grid.fingerprint_sha256 = oos::response_grid_fingerprint(grid);
   oos::HitBatch hits;
   hits.count = 2;
   hits.channels = 2;
@@ -101,6 +109,12 @@ TEST_CASE("conditional grid likelihood selects the matching response") {
   REQUIRE(restored.half_y_mm == grid.half_y_mm);
   REQUIRE(restored.conditional_log_probability ==
           grid.conditional_log_probability);
+  REQUIRE(restored.fingerprint_sha256 == grid.fingerprint_sha256);
+  REQUIRE(restored.source_backend == "structured_analytic");
+  REQUIRE(restored.source_relative_tolerance == 2.0e-5);
+  REQUIRE(restored.source_maximum_subdivision_depth == 6);
+  REQUIRE(restored.structured_disk_mu_order == 31);
+  REQUIRE(restored.structured_disk_phi_count == 72);
   std::filesystem::remove(path);
 }
 
@@ -111,6 +125,7 @@ TEST_CASE("Parallel-line response grid metadata round trips") {
       xy, efficiency, 2, {10, 11}, 2.0, 2.0, 1.0e-15, "parallel_lines",
       2.0, 0.5, -0.5, 1.0, 2);
   grid.source_angular_mode = "rectangular_line_neighborhood_isotropic_product";
+  grid.effective_response_fingerprint_sha256 = "effective-fingerprint";
   grid.source_z_mm = 17.499;
   grid.source_thickness_mm = 0.006;
   grid.source_transverse_count = 64;
@@ -119,6 +134,7 @@ TEST_CASE("Parallel-line response grid metadata round trips") {
   grid.source_medium_z_max_mm = 17.5;
   grid.source_mu_order = 32;
   grid.source_phi_count = 128;
+  grid.fingerprint_sha256 = oos::response_grid_fingerprint(grid);
   const auto path = std::filesystem::temp_directory_path() /
                     "oos-line-response-grid-test.h5";
   oos::save_response_grid_hdf5(path, grid);
@@ -137,6 +153,7 @@ TEST_CASE("Parallel-line response grid metadata round trips") {
   REQUIRE(restored.source_medium_z_max_mm == 17.5);
   REQUIRE(restored.source_mu_order == 32);
   REQUIRE(restored.source_phi_count == 128);
+  REQUIRE(restored.fingerprint_sha256 == grid.fingerprint_sha256);
   oos::HitBatch hits;
   hits.count = 2;
   hits.channels = 2;

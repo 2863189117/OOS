@@ -121,7 +121,7 @@ void write_factorized_block(const std::filesystem::path& path) {
   const std::string grid =
       R"({"position_radial_bins":1,"position_phi_bins":1,"direction_mu_bins":1,"direction_phi_bins":1})";
   const std::string generator =
-      R"({"schema":"oos.nonlocal.function.v1","state_count":1,"egress_count":1,"surface_phi_bins":1,"angular_count":1,"contraction_bound":0.4})";
+      R"({"schema":"oos.nonlocal.function.v1","state_count":1,"egress_count":1,"surface_phi_bins":1,"angular_count":1,"contraction_bound":0.4,"explicit_collision_order":7})";
   dataset(file, "/metadata/loss_names_json", H5T_NATIVE_UINT8,
           std::vector<std::uint8_t>(losses.begin(), losses.end()),
           {losses.size()});
@@ -156,7 +156,7 @@ void write_complex_adjoint_block(const std::filesystem::path& path) {
   const std::string grid =
       R"({"position_radial_bins":1,"position_phi_bins":3,"direction_mu_bins":1,"direction_phi_bins":1})";
   const std::string generator =
-      R"({"schema":"oos.nonlocal.function.v1","state_count":3,"egress_count":8,"surface_phi_bins":4,"angular_count":2,"contraction_bound":0.45})";
+      R"({"schema":"oos.nonlocal.function.v1","state_count":3,"egress_count":8,"surface_phi_bins":4,"angular_count":2,"contraction_bound":0.45,"explicit_collision_order":7})";
   dataset(file, "/metadata/phase_grid_json", H5T_NATIVE_UINT8,
           std::vector<std::uint8_t>(grid.begin(), grid.end()),
           {grid.size()});
@@ -259,8 +259,8 @@ TEST_CASE("LXe plugin emits a native standard operator block") {
        {1.0, 0.0, 0.0, 0.0},
        {1.0, 0.0, 0.0},
        0});
-  const auto batch =
-      oos::trace_source_quadratures(scene, imported, {source});
+  const oos::SourceTraceRuntime runtime(scene, imported);
+  const auto batch = runtime.trace({source});
   REQUIRE(batch.initial_states.at(0) > 0.0);
   const auto solved = oos::Solver::solve_cpu(imported, batch);
   double accounted = solved.unresolved.at(0);
@@ -280,6 +280,15 @@ TEST_CASE("LXe factorized block executes through the function ABI") {
                      {"factorized_block_hdf5", path.string()}}
           .dump();
   oos::SurfacePlugin plugin(OOS_TEST_LXE_PLUGIN_PATH);
+  plugin.validate(config, 7.0);
+  const auto mismatched =
+      nlohmann::json{{"geometry", "finite_cylinder"},
+                     {"explicit_collision_order", 2},
+                     {"factorized_block_hdf5", path.string()}}
+          .dump();
+  REQUIRE_THROWS_WITH(
+      plugin.validate(mismatched, 7.0),
+      Catch::Matchers::ContainsSubstring("does not match the function block"));
   const auto payload = plugin.build(config, 7.0);
   REQUIRE(nlohmann::json::parse(payload.metadata_json)
               .at("execution")

@@ -201,6 +201,7 @@ sources:
       quadrature: gauss_legendre
     angular:
       type: isotropic_surface_shape_factor
+      backend: structured_analytic
       relative_tolerance: 2.5e-6
       maximum_subdivision_depth: 0
       minimum_refinement_solid_angle_fraction: 3.0e-5
@@ -209,6 +210,8 @@ sources:
       maximum_approximate_solid_angle_fraction: 8.0e-6
       aperture_edge_phi_order: 12
       aperture_edge_weight_threshold: 6.0e-8
+      structured_disk_mu_order: 20
+      structured_disk_phi_count: 80
 )";
   }
   oos::Scene scene;
@@ -217,6 +220,8 @@ sources:
   REQUIRE(sources.size() == 1);
   CHECK(sources[0].integration ==
         oos::SourceIntegration::isotropic_surface_shape_factor);
+  CHECK(sources[0].shape_factor.backend ==
+        oos::ShapeFactorBackend::structured_analytic);
   REQUIRE(sources[0].rays.empty());
   REQUIRE(sources[0].points.size() == 4);
   double total = 0.0;
@@ -241,5 +246,7 @@ sources:
   CHECK(sources[0].shape_factor.aperture_edge_phi_order == 12);
   CHECK(sources[0].shape_factor.aperture_edge_weight_threshold ==
         Catch::Approx(6.0e-8));
+  CHECK(sources[0].shape_factor.structured_disk_mu_order == 20);
+  CHECK(sources[0].shape_factor.structured_disk_phi_count == 80);
   std::filesystem::remove(path);
 }

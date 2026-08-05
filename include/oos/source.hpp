@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,7 +29,17 @@ enum class SourceIntegration {
   isotropic_surface_shape_factor,
 };
 
+enum class ShapeFactorBackend {
+  automatic,
+  generic_bvh,
+  structured_analytic,
+};
+
 struct ShapeFactorOptions {
+  // `automatic` uses explicit structured-visibility metadata where available
+  // and falls back element-by-element. `structured_analytic` requires every
+  // outward source-boundary candidate to carry a supported declaration.
+  ShapeFactorBackend backend{ShapeFactorBackend::automatic};
   // The adaptive estimate is the L1 difference between one centroid
   // evaluation and the sum over four child triangles. The requested global
   // tolerance is divided across top-level boundary triangles; each child
@@ -56,6 +67,12 @@ struct ShapeFactorOptions {
   // the center-visibility decision used by the optimized path.
   std::uint32_t aperture_edge_phi_order{8};
   double aperture_edge_weight_threshold{1.0e-7};
+  // Order 31 selects an embedded Gauss-Kronrod 15/31 rule in direction
+  // cosine and an embedded periodic 32/64 rule in azimuth, so the error row
+  // reuses the full-resolution ray traces. Other orders use independent
+  // full- and half-resolution Gauss-Legendre passes.
+  std::uint32_t structured_disk_mu_order{31};
+  std::uint32_t structured_disk_phi_count{64};
 };
 
 struct SourceQuadrature {
@@ -66,6 +83,29 @@ struct SourceQuadrature {
   ShapeFactorOptions shape_factor;
 };
 
+// Reusable source-tracing state. Constructing this object validates the
+// operator dimensions, builds the ray-intersection scene, loads surface
+// plug-ins, and indexes source-boundary candidates once. Reuse one runtime
+// across likelihood/grid batches to keep those fixed costs out of every
+// source call.
+class SourceTraceRuntime {
+ public:
+  SourceTraceRuntime(const Scene& scene, const OperatorSet& operators);
+  ~SourceTraceRuntime();
+
+  SourceTraceRuntime(const SourceTraceRuntime&) = delete;
+  SourceTraceRuntime& operator=(const SourceTraceRuntime&) = delete;
+  SourceTraceRuntime(SourceTraceRuntime&&) noexcept;
+  SourceTraceRuntime& operator=(SourceTraceRuntime&&) noexcept;
+
+  SourceBatch trace(
+      const std::vector<SourceQuadrature>& quadratures) const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 std::vector<Vec3> uniform_rectangular_line_neighborhood_samples(
     const Vec3& line_center_mm, double obstacle_half_width_mm,
     double obstacle_half_thickness_mm, double maximum_distance_mm,
@@ -73,9 +113,5 @@ std::vector<Vec3> uniform_rectangular_line_neighborhood_samples(
 
 std::vector<SourceQuadrature> load_sources_yaml(
     const std::filesystem::path& path, const Scene& scene);
-
-SourceBatch trace_source_quadratures(
-    const Scene& scene, const OperatorSet& operators,
-    const std::vector<SourceQuadrature>& quadratures);
 
 }  // namespace oos

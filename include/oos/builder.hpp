@@ -12,8 +12,4 @@ class OperatorBuilder {
   static OperatorSet build(const Scene& scene);
 };
 
-SourceBatch trace_source_quadratures(
-    const Scene& scene, const OperatorSet& operators,
-    const std::vector<SourceQuadrature>& quadratures);
-
 }  // namespace oos

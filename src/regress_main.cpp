@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "oos/cuda_solver.hpp"
 #include "oos/effective_response.hpp"
 #include "oos/hash.hpp"
@@ -37,7 +41,11 @@ void usage() {
          "[--obstacle-half-thickness-mm 0.0005] "
          "[--source-medium-z-max-mm 17.5] "
          "[--source-mu-order 32] [--source-phi-count 128] "
-         "[--source-subdivision-depth 8] [--batch-size 8] "
+         "[--source-backend auto|generic_bvh|structured_analytic] "
+         "[--structured-disk-mu-order 31] "
+         "[--structured-disk-phi-count 64] "
+         "[--source-subdivision-depth 8] [--batch-size auto|N] "
+         "[--verify-effective-content] "
          "[--surface-basis selection.h5] [--device cpu|cuda]\n"
       << "  oos-regress fit --hits hits.h5 --output regression.h5 "
          "[--grid grid.h5] [--operators operators.h5 "
@@ -48,9 +56,12 @@ void usage() {
          "shape_factor|isotropic_product|rectangular_line_neighborhood_isotropic_product] "
          "[--source-transverse-count 32] "
          "[--source-mu-order 32] [--source-phi-count 128] "
+         "[--source-backend auto|generic_bvh|structured_analytic] "
+         "[--structured-disk-mu-order 31] "
+         "[--structured-disk-phi-count 64] "
          "[--refine-spacings-mm 40,5,1,0.25,0.1] "
          "[--refine-half-widths-mm 160,20,4,1,0.4] "
-         "[--batch-size 8] "
+         "[--batch-size auto|N] "
          "[--grid-only] [--adjoint]\n";
 }
 
@@ -65,6 +76,52 @@ bool flag(int argc, char** argv, const std::string& name) {
   for (int i = 0; i < argc; ++i)
     if (argv[i] == name) return true;
   return false;
+}
+
+oos::ShapeFactorBackend shape_factor_backend(const std::string& value) {
+  if (value == "auto") return oos::ShapeFactorBackend::automatic;
+  if (value == "generic_bvh") return oos::ShapeFactorBackend::generic_bvh;
+  if (value == "structured_analytic")
+    return oos::ShapeFactorBackend::structured_analytic;
+  throw std::runtime_error(
+      "--source-backend must be auto, generic_bvh, or structured_analytic");
+}
+
+std::string shape_factor_backend_name(oos::ShapeFactorBackend backend) {
+  switch (backend) {
+    case oos::ShapeFactorBackend::automatic:
+      return "auto";
+    case oos::ShapeFactorBackend::generic_bvh:
+      return "generic_bvh";
+    case oos::ShapeFactorBackend::structured_analytic:
+      return "structured_analytic";
+  }
+  throw std::runtime_error("unknown shape-factor backend");
+}
+
+std::uint64_t source_batch_size(
+    const std::string& value, const oos::EffectiveResponse& response) {
+  if (value != "auto") {
+    std::size_t consumed = 0;
+    const auto parsed = std::stoull(value, &consumed);
+    if (consumed != value.size() || parsed == 0)
+      throw std::runtime_error(
+          "--batch-size must be auto or a positive integer");
+    return parsed;
+  }
+  std::uint64_t workers = 1;
+#ifdef _OPENMP
+  workers = static_cast<std::uint64_t>(omp_get_max_threads());
+#endif
+  constexpr std::uint64_t memory_cap = 512ull * 1024ull * 1024ull;
+  const std::uint64_t values_per_candidate =
+      response.states + 2 * response.channels + response.losses;
+  const std::uint64_t bytes_per_candidate =
+      std::max<std::uint64_t>(1, values_per_candidate) * sizeof(double);
+  const std::uint64_t memory_limited =
+      std::max<std::uint64_t>(1, memory_cap / bytes_per_candidate);
+  return std::max<std::uint64_t>(
+      1, std::min<std::uint64_t>(4 * workers, memory_limited));
 }
 
 std::vector<double> comma_separated_doubles(const std::string& value) {
@@ -259,6 +316,8 @@ class CandidateEvaluator {
         operators_.cache_key_sha256)
       throw std::runtime_error(
           "precomputed response does not match operators.h5");
+    source_runtime_ =
+        std::make_unique<oos::SourceTraceRuntime>(scene_, operators_);
 #ifdef OOS_HAS_CUDA
     if (device_ == "cuda")
       cuda_ =
@@ -296,8 +355,7 @@ class CandidateEvaluator {
           "--source-angular-mode must be shape_factor, isotropic_product, "
           "or rectangular_line_neighborhood_isotropic_product");
     }
-    const auto sources =
-        oos::trace_source_quadratures(scene_, operators_, quadratures);
+    const auto sources = source_runtime_->trace(quadratures);
     if (device_ == "cpu")
       return oos::apply_effective_response_cpu(response_, sources);
 #ifdef OOS_HAS_CUDA
@@ -324,6 +382,7 @@ class CandidateEvaluator {
   double source_medium_z_max_mm_{};
   std::uint32_t source_mu_order_{};
   std::uint32_t source_phi_count_{};
+  std::unique_ptr<oos::SourceTraceRuntime> source_runtime_;
 #ifdef OOS_HAS_CUDA
   std::unique_ptr<oos::CudaEffectiveResponseRuntime> cuda_;
 #endif
@@ -502,11 +561,19 @@ int main(int argc, char** argv) {
         throw std::runtime_error(
             "--source-thickness-mm must be nonnegative");
       oos::ShapeFactorOptions shape_factor;
+      shape_factor.backend = shape_factor_backend(
+          option(argc, argv, "--source-backend", "auto"));
       shape_factor.maximum_subdivision_depth =
           static_cast<std::uint32_t>(std::stoul(
               option(argc, argv, "--source-subdivision-depth", "8")));
       shape_factor.relative_tolerance = std::stod(
           option(argc, argv, "--source-relative-tolerance", "1e-5"));
+      shape_factor.structured_disk_mu_order =
+          static_cast<std::uint32_t>(std::stoul(
+              option(argc, argv, "--structured-disk-mu-order", "31")));
+      shape_factor.structured_disk_phi_count =
+          static_cast<std::uint32_t>(std::stoul(
+              option(argc, argv, "--structured-disk-phi-count", "64")));
       const auto source_angular_mode =
           option(argc, argv, "--source-angular-mode", "shape_factor");
       const auto source_transverse_count = static_cast<std::uint32_t>(
@@ -532,9 +599,9 @@ int main(int argc, char** argv) {
       const double spacing =
           std::stod(option(argc, argv, "--spacing-mm", "10"));
       const auto domain = search_domain_from_arguments(argc, argv);
-      const auto batch_size =
-          static_cast<std::uint64_t>(
-              std::stoull(option(argc, argv, "--batch-size", "8")));
+      const auto batch_size = source_batch_size(
+          option(argc, argv, "--batch-size", "auto"),
+          evaluator.response());
       std::vector<double> xy;
       if (domain.shape == "disk")
         xy = oos::cartesian_disk_grid(domain.radius, spacing);
@@ -564,8 +631,12 @@ int main(int argc, char** argv) {
           evaluator.response().channel_ids, domain.radius, spacing, 1.0e-15,
           domain.shape, domain.half_x, domain.half_y, domain.line_y_start,
           domain.line_pitch, domain.line_count);
-      grid.effective_response_sha256 = oos::sha256_file(precomputed);
+      grid.effective_response_fingerprint_sha256 =
+          oos::effective_response_fingerprint(evaluator.response());
+      if (flag(argc, argv, "--verify-effective-content"))
+        grid.effective_response_sha256 = oos::sha256_file(precomputed);
       grid.source_angular_mode = source_angular_mode;
+      grid.source_backend = shape_factor_backend_name(shape_factor.backend);
       grid.source_z_mm = source_z;
       grid.source_thickness_mm = source_thickness;
       grid.source_transverse_count = source_transverse_count;
@@ -574,6 +645,14 @@ int main(int argc, char** argv) {
       grid.source_medium_z_max_mm = source_medium_z_max;
       grid.source_mu_order = source_mu_order;
       grid.source_phi_count = source_phi_count;
+      grid.source_relative_tolerance = shape_factor.relative_tolerance;
+      grid.source_maximum_subdivision_depth =
+          shape_factor.maximum_subdivision_depth;
+      grid.structured_disk_mu_order =
+          shape_factor.structured_disk_mu_order;
+      grid.structured_disk_phi_count =
+          shape_factor.structured_disk_phi_count;
+      grid.fingerprint_sha256 = oos::response_grid_fingerprint(grid);
       auto temporary = std::filesystem::path(output);
       temporary += ".tmp";
       oos::save_response_grid_hdf5(temporary, grid);
@@ -626,11 +705,19 @@ int main(int argc, char** argv) {
           throw std::runtime_error(
               "--source-thickness-mm must be nonnegative");
         oos::ShapeFactorOptions shape_factor;
+        shape_factor.backend = shape_factor_backend(
+            option(argc, argv, "--source-backend", "auto"));
         shape_factor.maximum_subdivision_depth =
             static_cast<std::uint32_t>(std::stoul(
                 option(argc, argv, "--source-subdivision-depth", "8")));
         shape_factor.relative_tolerance = std::stod(
             option(argc, argv, "--source-relative-tolerance", "1e-5"));
+        shape_factor.structured_disk_mu_order =
+            static_cast<std::uint32_t>(std::stoul(
+                option(argc, argv, "--structured-disk-mu-order", "31")));
+        shape_factor.structured_disk_phi_count =
+            static_cast<std::uint32_t>(std::stoul(
+                option(argc, argv, "--structured-disk-phi-count", "64")));
         const auto source_angular_mode =
             option(argc, argv, "--source-angular-mode", "shape_factor");
         const auto source_transverse_count = static_cast<std::uint32_t>(
@@ -646,8 +733,8 @@ int main(int argc, char** argv) {
             std::stoul(option(argc, argv, "--source-mu-order", "32")));
         const auto source_phi_count = static_cast<std::uint32_t>(
             std::stoul(option(argc, argv, "--source-phi-count", "128")));
-        const auto batch_size = static_cast<std::uint64_t>(
-            std::stoull(option(argc, argv, "--batch-size", "8")));
+        const auto batch_size = source_batch_size(
+            option(argc, argv, "--batch-size", "auto"), response);
         if (grid_path.empty())
           result = centroid_initial(scene, response, hits, domain);
         evaluator = std::make_unique<CandidateEvaluator>(

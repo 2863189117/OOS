@@ -1,12 +1,15 @@
 #include "oos/effective_response.hpp"
 
 #include "oos/function_operator.hpp"
+#include "oos/hash.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 
 namespace oos {
@@ -129,6 +132,21 @@ std::vector<double> apply_adjoint_cycle(
 
 }  // namespace
 
+std::string effective_response_fingerprint(
+    const EffectiveResponse& response) {
+  std::ostringstream material;
+  material << "oos.effective-response.semantic.v1\n"
+           << response.operator_cache_key_sha256 << '\n'
+           << response.construction_method << '\n'
+           << response.cycles << '\n'
+           << std::setprecision(17) << response.operator_tolerance << '\n'
+           << response.states << '\n'
+           << response.channels << '\n'
+           << response.losses << '\n'
+           << response.code_commit;
+  return sha256_string(material.str());
+}
+
 void EffectiveResponse::validate() const {
   if (states == 0 || channels == 0 || cycles == 0 || build_batch_size == 0 ||
       !std::isfinite(operator_tolerance) || operator_tolerance <= 0.0 ||
@@ -210,6 +228,7 @@ EffectiveResponse build_effective_response_cpu(const OperatorSet& operators,
     unresolved_state = apply_adjoint_cycle(
         operators, functions, unresolved_state, no_detection, no_loss, 1);
   response.state_unresolved = std::move(unresolved_state);
+  response.fingerprint_sha256 = effective_response_fingerprint(response);
   response.validate();
   return response;
 }

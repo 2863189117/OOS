@@ -130,8 +130,9 @@ int main(int argc, char** argv) {
           throw std::runtime_error("--scene is required for sources.yaml");
         const oos::Scene scene =
             configured_scene(argc, argv, scene_path);
-        sources = oos::trace_source_quadratures(
-            scene, operators, oos::load_sources_yaml(source_path, scene));
+        const oos::SourceTraceRuntime runtime(scene, operators);
+        sources = runtime.trace(
+            oos::load_sources_yaml(source_path, scene));
       } else {
         sources = oos::load_source_batch_hdf5(
             source_path, operators.transition.rows, operators.detection.cols,

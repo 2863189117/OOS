@@ -348,6 +348,18 @@ std::vector<SourceQuadrature> load_sources_yaml(
     if (angular_type == "isotropic_surface_shape_factor") {
       quadrature.integration =
           SourceIntegration::isotropic_surface_shape_factor;
+      const auto backend = angular["backend"].as<std::string>();
+      if (backend == "auto")
+        quadrature.shape_factor.backend = ShapeFactorBackend::automatic;
+      else if (backend == "generic_bvh")
+        quadrature.shape_factor.backend = ShapeFactorBackend::generic_bvh;
+      else if (backend == "structured_analytic")
+        quadrature.shape_factor.backend =
+            ShapeFactorBackend::structured_analytic;
+      else
+        throw std::runtime_error(
+            "shape-factor backend must be auto, generic_bvh, or "
+            "structured_analytic");
       if (angular["relative_tolerance"])
         quadrature.shape_factor.relative_tolerance =
             angular["relative_tolerance"].as<double>();
@@ -372,6 +384,12 @@ std::vector<SourceQuadrature> load_sources_yaml(
       if (angular["aperture_edge_weight_threshold"])
         quadrature.shape_factor.aperture_edge_weight_threshold =
             angular["aperture_edge_weight_threshold"].as<double>();
+      if (angular["structured_disk_mu_order"])
+        quadrature.shape_factor.structured_disk_mu_order =
+            angular["structured_disk_mu_order"].as<std::uint32_t>();
+      if (angular["structured_disk_phi_count"])
+        quadrature.shape_factor.structured_disk_phi_count =
+            angular["structured_disk_phi_count"].as<std::uint32_t>();
       if (!(quadrature.shape_factor.relative_tolerance > 0.0) ||
           !std::isfinite(quadrature.shape_factor.relative_tolerance))
         throw std::runtime_error(
@@ -410,6 +428,10 @@ std::vector<SourceQuadrature> load_sources_yaml(
         throw std::runtime_error(
             "shape-factor aperture edge threshold must be finite and "
             "non-negative");
+      if (quadrature.shape_factor.structured_disk_mu_order < 2 ||
+          quadrature.shape_factor.structured_disk_phi_count < 2)
+        throw std::runtime_error(
+            "shape-factor structured disk orders must be at least two");
       quadrature.points.reserve(positions.size());
       for (const auto& [position, position_weight] : positions) {
         Stokes weighted = polarization;

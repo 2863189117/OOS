@@ -51,8 +51,9 @@ sources:
   const auto scene = oos::Scene::load(root / "scene.yaml");
   REQUIRE(oos::SceneValidator::validate(scene).ok());
   const auto operators = oos::OperatorBuilder::build(scene);
-  const auto sources = oos::trace_source_quadratures(
-      scene, operators, oos::load_sources_yaml(root / "sources.yaml", scene));
+  const oos::SourceTraceRuntime runtime(scene, operators);
+  const auto sources = runtime.trace(
+      oos::load_sources_yaml(root / "sources.yaml", scene));
   const auto result = oos::Solver::solve_cpu(operators, sources);
   REQUIRE(result.input_weight.at(0) > 0.999999999);
   double accounted = result.unresolved.at(0);

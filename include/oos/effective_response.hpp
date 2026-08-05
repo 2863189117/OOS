@@ -26,10 +26,16 @@ struct EffectiveResponse {
   std::vector<std::int32_t> channel_ids;
   std::vector<std::string> loss_names;
   std::string operator_cache_key_sha256;
+  // Fast identity for the response semantics. Version-3 files persist this
+  // value so consumers do not hash the multi-gigabyte HDF5 payload.
+  std::string fingerprint_sha256;
   std::string code_commit;
 
   void validate() const;
 };
+
+std::string effective_response_fingerprint(
+    const EffectiveResponse& response);
 
 // Builds the bounded response by propagating terminal bases through the
 // adjoint transport operator. There is intentionally no forward-basis

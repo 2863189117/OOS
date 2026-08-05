@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -90,6 +91,28 @@ std::string block_path(const nlohmann::json& configuration) {
   if (configuration.contains("factorized_block_hdf5"))
     return configuration.at("factorized_block_hdf5").get<std::string>();
   return configuration.value("precomputed_block_hdf5", std::string{});
+}
+
+std::optional<std::int64_t> block_explicit_collision_order(
+    const std::string& path) {
+  const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+  if (file < 0) throw std::runtime_error("cannot open LXe function block");
+  try {
+    if (!exists(file, "/metadata/generator_json")) {
+      H5Fclose(file);
+      return std::nullopt;
+    }
+    const auto metadata =
+        nlohmann::json::parse(read_string(file, "/metadata/generator_json"));
+    std::optional<std::int64_t> result;
+    if (metadata.contains("explicit_collision_order"))
+      result = metadata.at("explicit_collision_order").get<std::int64_t>();
+    H5Fclose(file);
+    return result;
+  } catch (...) {
+    H5Fclose(file);
+    throw;
+  }
 }
 
 LXeFunctionInstance load_function_instance(const std::string& path) {
@@ -194,8 +217,11 @@ oos_plugin_validation_v1 validate(oos_string_view_v1 config,
     const auto parsed = nlohmann::json::parse(value.empty() ? "{}" : value);
     if (parsed.value("geometry", "finite_cylinder") != "finite_cylinder")
       throw std::runtime_error("LXe v1 supports only finite_cylinder geometry");
-    if (parsed.value("explicit_collision_order", 7) != 7)
-      throw std::runtime_error("LXe v1 requires explicit_collision_order=7");
+    const auto collision_order =
+        parsed.value("explicit_collision_order", std::int64_t{0});
+    if (collision_order <= 0)
+      throw std::runtime_error(
+          "LXe explicit_collision_order must be positive");
     if (parsed.value("replaces_full_operator", false))
       throw std::runtime_error(
           "full-operator replacement is forbidden; provide a nonlocal block");
@@ -205,6 +231,10 @@ oos_plugin_validation_v1 validate(oos_string_view_v1 config,
           "factorized_block_hdf5 or precomputed_block_hdf5 is required");
     if (!std::filesystem::is_regular_file(path))
       throw std::runtime_error("precomputed LXe operator does not exist");
+    if (const auto stored = block_explicit_collision_order(path);
+        stored && *stored != collision_order)
+      throw std::runtime_error(
+          "LXe explicit_collision_order does not match the function block");
     message.clear();
     return {0, {nullptr, 0}};
   } catch (const std::exception& exception) {
@@ -249,6 +279,7 @@ int32_t build(oos_string_view_v1 config, double,
           read_string(file, "/metadata/loss_names_json"));
       const auto generator = nlohmann::json::parse(
           read_string(file, "/metadata/generator_json"));
+      const auto collision_order = generator.at("explicit_collision_order");
       H5Fclose(file);
       const auto metadata =
           nlohmann::json{
@@ -256,7 +287,7 @@ int32_t build(oos_string_view_v1 config, double,
               {"locality", "nonlocal"},
               {"execution", "function"},
               {"state_count", generator.at("state_count")},
-              {"explicit_collision_order", 7},
+              {"explicit_collision_order", collision_order},
               {"source", path},
               {"loss_names", loss_names}}
               .dump();
@@ -327,11 +358,13 @@ int32_t build(oos_string_view_v1 config, double,
     }
     const auto loss_names = nlohmann::json::parse(
         read_string(file, "/metadata/loss_names_json"));
+    const auto collision_order =
+        parsed.at("explicit_collision_order").get<std::int64_t>();
     H5Fclose(file);
     const auto metadata =
         nlohmann::json{{"mode", "nonlocal_operator_block"},
                        {"locality", "nonlocal"},
-                       {"explicit_collision_order", 7},
+                       {"explicit_collision_order", collision_order},
                        {"source", path},
                        {"loss_names", loss_names}}
             .dump();

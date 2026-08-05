@@ -15,6 +15,15 @@ struct AnalyticHole {
   double radius_mm{};
 };
 
+// Declares that one exact analytic primitive replaces a complete collection
+// of source-quadrature triangles.  `directional_disk` integrates the disk in
+// solid-angle coordinates and therefore does not inherit the validation
+// mesh's element count or tessellation quality.
+enum class AnalyticSourceIntegral : std::uint8_t {
+  none = 0,
+  directional_disk = 1,
+};
+
 struct AnalyticPrimitive {
   GeometryPrimitiveKind kind{GeometryPrimitiveKind::disk};
   Vec3 center_mm;
@@ -35,6 +44,7 @@ struct AnalyticPrimitive {
   std::int32_t plus_domain_id{-1};
   std::int32_t channel_id{-1};
   std::uint64_t surface_element{};
+  AnalyticSourceIntegral source_integral{AnalyticSourceIntegral::none};
   std::vector<AnalyticHole> holes;
 };
 
@@ -43,6 +53,15 @@ enum class AnalyticSurfaceCoordinates : std::uint8_t {
   cylinder_phi_z = 1,
   annulus_r2_phi = 2,
   box_face_uv = 3,
+};
+
+// Declares when source integration may replace a general first-hit query with
+// a geometry-specific visibility rule. The declaration is explicit and
+// fail-closed; only `direct` and `projected_aperture` bypass a BVH first hit.
+enum class AnalyticSourceVisibility : std::uint8_t {
+  ray_traced = 0,
+  direct = 1,
+  projected_aperture = 2,
 };
 
 struct AnalyticSurfaceElement {
@@ -65,6 +84,8 @@ struct AnalyticSurfaceElement {
   // integration.  Diffuse radiance elements normally set this flag; terminal
   // disks may additionally provide integration cells without owning states.
   bool source_quadrature{true};
+  AnalyticSourceVisibility source_visibility{
+      AnalyticSourceVisibility::ray_traced};
   // Optional finite-cell visibility aperture used only by source integration.
   // The referenced primitive must be a perforated disk and the hole index
   // selects one of its circular openings.  The optical element remains owned
@@ -82,8 +103,7 @@ struct MeshData {
   // Geometry primitives and optical surface basis functions are independent.
   // The identifier is local to a surface.  Multiple triangles with the same
   // (surface_id, surface_basis_id, primary-domain side) share one radiance
-  // state.  Legacy geometry files omit the dataset and are interpreted as one
-  // basis function per triangle.
+  // state.
   std::vector<std::uint32_t> surface_basis_id;
   std::vector<std::int32_t> minus_domain_id;
   std::vector<std::int32_t> plus_domain_id;
@@ -94,9 +114,13 @@ struct MeshData {
   std::vector<std::uint8_t> triangle_transport;
   // Source integration and transport ownership are independent.  A triangle
   // can partition an exact analytic surface for adaptive solid-angle
-  // integration without participating in runtime intersection.  Files that
-  // omit this mask inherit triangle_transport.
+  // integration without participating in runtime intersection.
   std::vector<std::uint8_t> triangle_source_quadrature;
+  // Mapping from a source-quadrature triangle to the exact analytic
+  // primitive that owns its first hit.  UINT32_MAX keeps the general BVH
+  // visibility query.  This permits a validation mesh to provide adaptive
+  // solid-angle cells while a disk/cylinder/box provides exact intersection.
+  std::vector<std::uint32_t> triangle_source_analytic_primitive;
   std::vector<AnalyticPrimitive> analytic_primitives;
   std::vector<AnalyticSurfaceElement> analytic_surface_elements;
 };

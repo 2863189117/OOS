@@ -54,8 +54,8 @@ oos::SourceBatch sources_for(
   if (scene_path.empty())
     throw std::runtime_error("--scene is required for sources.yaml");
   const auto scene = configured_scene(argc, argv, scene_path);
-  return oos::trace_source_quadratures(
-      scene, operators, oos::load_sources_yaml(source_path, scene));
+  const oos::SourceTraceRuntime runtime(scene, operators);
+  return runtime.trace(oos::load_sources_yaml(source_path, scene));
 }
 
 oos::EffectiveResponse build_response(const oos::OperatorSet& operators,
