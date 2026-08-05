@@ -40,6 +40,8 @@ class RunExampleTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--validation-profile") + 1], "smoke"
         )
+        self.assertEqual(RUN_EXAMPLE.lxe_generator_profile("smoke"), ["--test"])
+        self.assertEqual(RUN_EXAMPLE.lxe_generator_profile("coarse"), [])
 
     def test_scene_uses_the_selected_lxe_block_grid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -81,6 +83,70 @@ class RunExampleTest(unittest.TestCase):
             )
             self.assertIn('"position_radial_bins":2', text)
             self.assertNotIn('"position_radial_bins":24', text)
+
+    def test_lxe_block_must_match_geometry_radius_and_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            geometry = directory / "geometry.h5"
+            block = directory / "block.h5"
+            with h5py.File(geometry, "w") as handle:
+                write_json(
+                    handle,
+                    "/metadata/generator_json",
+                    {
+                        "config": {
+                            "active_radius_mm": 12.0,
+                            "lxe_depth_mm": 34.0,
+                        }
+                    },
+                )
+                analytic = handle.create_group("analytic")
+                analytic.create_dataset("kind", data=[1])
+                analytic.create_dataset("surface_id", data=[1])
+                analytic.create_dataset(
+                    "parameters", data=[[12.0, 0.0, 0.0, 0.0]]
+                )
+            with h5py.File(block, "w") as handle:
+                write_json(
+                    handle,
+                    "/metadata/generator_json",
+                    {
+                        "lxe_config": {
+                            "radius_mm": 12.0,
+                            "depth_mm": 34.0,
+                        },
+                        "geometry_contract_sha256": "contract",
+                    },
+                )
+                write_json(
+                    handle,
+                    "/metadata/phase_grid_json",
+                    {
+                        "radius_mm": 12.0,
+                        "position_radial_bins": 4,
+                        "position_phi_bins": 8,
+                        "direction_mu_bins": 2,
+                        "direction_phi_bins": 4,
+                    },
+                )
+            contract = RUN_EXAMPLE.verify_lxe_block_geometry(geometry, block)
+            self.assertEqual(contract["radius_mm"], 12.0)
+            self.assertEqual(contract["depth_mm"], 34.0)
+            self.assertTrue(contract["test_profile"])
+            with h5py.File(block, "r+") as handle:
+                del handle["/metadata/generator_json"]
+                write_json(
+                    handle,
+                    "/metadata/generator_json",
+                    {
+                        "lxe_config": {
+                            "radius_mm": 13.0,
+                            "depth_mm": 34.0,
+                        }
+                    },
+                )
+            with self.assertRaisesRegex(RuntimeError, "dimensions"):
+                RUN_EXAMPLE.verify_lxe_block_geometry(geometry, block)
 
 
 if __name__ == "__main__":

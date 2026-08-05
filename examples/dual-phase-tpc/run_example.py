@@ -14,6 +14,7 @@ import sys
 import time
 
 import h5py
+import numpy as np
 
 
 def sha256(path: Path) -> str:
@@ -75,8 +76,64 @@ def analytic_geometry_command(
     ]
 
 
+def lxe_generator_profile(profile: str) -> list[str]:
+    return ["--test"] if profile == "smoke" else []
+
+
 def read_json_dataset(handle: h5py.File, path: str) -> dict:
     return json.loads(bytes(handle[path][...]).decode())
+
+
+def verify_lxe_block_geometry(geometry: Path, block: Path) -> dict:
+    with h5py.File(geometry, "r") as handle:
+        config = read_json_dataset(
+            handle, "/metadata/generator_json"
+        )["config"]
+        radius_mm = float(config["active_radius_mm"])
+        depth_mm = float(config["lxe_depth_mm"])
+        if "/analytic/kind" in handle:
+            kind = handle["/analytic/kind"][:]
+            surface = handle["/analytic/surface_id"][:]
+            parameters = handle["/analytic/parameters"][:]
+            selected = np.flatnonzero((kind == 1) & (surface == 1))
+            if len(selected) != 1:
+                raise RuntimeError(
+                    "geometry must declare exactly one analytic LXe disk"
+                )
+            analytic_radius = float(parameters[int(selected[0]), 0])
+            if abs(analytic_radius - radius_mm) > 1.0e-9:
+                raise RuntimeError(
+                    "analytic LXe disk radius disagrees with geometry metadata"
+                )
+    with h5py.File(block, "r") as handle:
+        generator = read_json_dataset(handle, "/metadata/generator_json")
+        phase_grid = read_json_dataset(handle, "/metadata/phase_grid_json")
+    liquid = generator["lxe_config"]
+    if (
+        abs(float(liquid["radius_mm"]) - radius_mm) > 1.0e-9
+        or abs(float(liquid["depth_mm"]) - depth_mm) > 1.0e-9
+        or abs(float(phase_grid["radius_mm"]) - radius_mm) > 1.0e-9
+    ):
+        raise RuntimeError(
+            "LXe block dimensions do not match the selected geometry"
+        )
+    return {
+        "radius_mm": radius_mm,
+        "depth_mm": depth_mm,
+        "geometry_contract_sha256": generator.get(
+            "geometry_contract_sha256"
+        ),
+        "test_profile": arguments_is_test_profile(phase_grid),
+    }
+
+
+def arguments_is_test_profile(phase_grid: dict) -> bool:
+    return (
+        int(phase_grid["position_radial_bins"]) == 4
+        and int(phase_grid["position_phi_bins"]) == 8
+        and int(phase_grid["direction_mu_bins"]) == 2
+        and int(phase_grid["direction_phi_bins"]) == 4
+    )
 
 
 def render_scene(template: Path, destination: Path, lxe_block: Path) -> dict:
@@ -144,15 +201,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--geometry-mode",
-        choices=("analytic", "l2"),
-        default="analytic",
-        help=(
-            "analytic uses an adaptive exact-surface radiance basis "
-            "(default); l2 uses a global triangle-derived 10 mm fallback"
-        ),
-    )
-    parser.add_argument(
         "--geometry-profile",
         choices=("smoke", "coarse", "production", "fine"),
         default="coarse",
@@ -161,8 +209,8 @@ def main() -> None:
         "--surface-basis",
         type=Path,
         help=(
-            "use an existing geometry with /surface_basis; when omitted a "
-            "nested conservative basis is generated from --geometry"
+            "use an existing analytic geometry/basis file; defaults to "
+            "--geometry"
         ),
     )
     parser.add_argument(
@@ -173,13 +221,6 @@ def main() -> None:
             "native builder and source tracer"
         ),
     )
-    parser.add_argument(
-        "--surface-basis-patch-sizes-mm",
-        type=float,
-        nargs="+",
-        default=[40.0, 20.0, 10.0, 0.0],
-    )
-    parser.add_argument("--surface-basis-active-level", type=int, default=2)
     parser.add_argument(
         "--lxe-block",
         type=Path,
@@ -215,27 +256,15 @@ def main() -> None:
     geometry = arguments.geometry
     if geometry is None:
         geometry = arguments.cache_dir / (
-            f"geometry-gas-height-60-{arguments.geometry_mode}-"
+            f"geometry-gas-height-60-analytic-"
             f"{arguments.geometry_profile}.h5"
         )
-        if arguments.geometry_mode == "analytic":
-            geometry_command = analytic_geometry_command(
-                arguments.python,
-                root,
-                geometry,
-                arguments.geometry_profile,
-            )
-        else:
-            geometry_command = [
-                arguments.python,
-                str(root / "generator" / "build_geometry.py"),
-                "--output",
-                str(geometry),
-                "--profile",
-                arguments.geometry_profile,
-                "--height-mm",
-                "60",
-            ]
+        geometry_command = analytic_geometry_command(
+            arguments.python,
+            root,
+            geometry,
+            arguments.geometry_profile,
+        )
         if arguments.force_rebuild:
             geometry_command.append("--force")
         stages.append(
@@ -245,47 +274,13 @@ def main() -> None:
             )
         )
     surface_basis = arguments.surface_basis
-    if surface_basis is None and arguments.geometry_mode == "analytic":
-        # The analytic geometry carries the adaptive exact-surface basis.
+    if surface_basis is None:
         surface_basis = geometry
-    elif surface_basis is None:
-        patch_label = "-".join(
-            f"{value:g}" for value in arguments.surface_basis_patch_sizes_mm
-        )
-        surface_basis = (
-            arguments.cache_dir
-            / (
-                f"geometry-basis-{arguments.geometry_profile}-"
-                f"{patch_label}-L{arguments.surface_basis_active_level}.h5"
-            )
-        )
-        basis_command = [
-            arguments.python,
-            str(root / "generator" / "build_surface_basis.py"),
-            "--input",
-            str(geometry),
-            "--output",
-            str(surface_basis),
-            "--patch-sizes-mm",
-            *[
-                f"{value:.17g}"
-                for value in arguments.surface_basis_patch_sizes_mm
-            ],
-            "--active-level",
-            str(arguments.surface_basis_active_level),
-        ]
-        if arguments.force_rebuild:
-            basis_command.append("--force")
-        stages.append(
-            run(
-                basis_command,
-                arguments.output / "build-surface-basis.log",
-            )
-        )
     link(surface_basis, arguments.output / "geometry.h5")
     lxe_block = arguments.lxe_block
     if lxe_block is None:
-        lxe_block = arguments.cache_dir / "lxe-factorized-block.h5"
+        suffix = "-test" if arguments.geometry_profile == "smoke" else ""
+        lxe_block = arguments.cache_dir / f"lxe-factorized-block{suffix}.h5"
         generator = [
             arguments.python,
             str(root / "generator" / "build_lxe_function_block.py"),
@@ -295,24 +290,26 @@ def main() -> None:
             str(lxe_block),
             "--processes",
             str(arguments.generator_processes),
+            *lxe_generator_profile(arguments.geometry_profile),
         ]
         if arguments.force_rebuild:
             generator.append("--force")
         stages.append(
             run(generator, arguments.output / "build-lxe-function.log")
         )
+    lxe_contract = verify_lxe_block_geometry(surface_basis, lxe_block)
     link(lxe_block, arguments.output / "lxe-factorized-block.h5")
     link(arguments.lxe_plugin, arguments.output / "liboos_lxe_plugin.so")
     lxe_plugin_config = render_scene(root / "scene.yaml", scene, lxe_block)
 
     operators = (
         arguments.cache_dir
-        / f"operators-{arguments.geometry_mode}-{arguments.geometry_profile}.h5"
+        / f"operators-analytic-{arguments.geometry_profile}.h5"
     )
     effective = (
         arguments.cache_dir
         / (
-            f"effective-adjoint-seven-cycle-{arguments.geometry_mode}-"
+            f"effective-adjoint-seven-cycle-v3-analytic-"
             f"{arguments.geometry_profile}.h5"
         )
     )
@@ -371,8 +368,7 @@ def main() -> None:
         )
     stages.append(run(solve, arguments.output / "solve.log"))
     manifest = {
-        "schema": "oos.dual-phase-tpc.example-run.v1",
-        "geometry_mode": arguments.geometry_mode,
+        "schema": "oos.dual-phase-tpc.example-run.v2",
         "inputs": {
             "geometry": {
                 "path": str(surface_basis.resolve()),
@@ -383,9 +379,7 @@ def main() -> None:
                 "path": str(geometry.resolve()),
                 "sha256": sha256(geometry),
             },
-            "surface_basis_generated_by_example": (
-                arguments.surface_basis is None
-            ),
+            "surface_basis_is_geometry": arguments.surface_basis is None,
             "surface_basis_selection": (
                 {
                     "path": str(
@@ -400,6 +394,7 @@ def main() -> None:
                 "path": str(lxe_block.resolve()),
                 "sha256": sha256(lxe_block),
                 "generated_by_example": arguments.lxe_block is None,
+                "geometry_contract": lxe_contract,
             },
             "lxe_plugin": {
                 "path": str(arguments.lxe_plugin.resolve()),

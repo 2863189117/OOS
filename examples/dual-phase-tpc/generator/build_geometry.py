@@ -757,6 +757,23 @@ def write_geometry(
                 "channel_id",
                 data=np.asarray(mesh.channel_id, dtype=np.int32),
             )
+            triangle_count = len(mesh.triangles)
+            group.create_dataset(
+                "triangle_transport",
+                data=np.ones(triangle_count, dtype=np.uint8),
+            )
+            group.create_dataset(
+                "triangle_source_quadrature",
+                data=np.ones(triangle_count, dtype=np.uint8),
+            )
+            group.create_dataset(
+                "triangle_source_analytic_primitive",
+                data=np.full(
+                    triangle_count,
+                    np.iinfo(np.uint32).max,
+                    dtype=np.uint32,
+                ),
+            )
             metadata = handle.create_group("metadata")
             metadata.create_dataset(
                 "generator_json",

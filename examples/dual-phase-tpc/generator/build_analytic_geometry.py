@@ -62,6 +62,12 @@ PLANE_UV = 0
 CYLINDER_PHI_Z = 1
 ANNULUS_R2_PHI = 2
 
+SOURCE_VISIBILITY_RAY_TRACED = 0
+SOURCE_VISIBILITY_DIRECT = 1
+SOURCE_VISIBILITY_PROJECTED_APERTURE = 2
+SOURCE_INTEGRAL_NONE = 0
+SOURCE_INTEGRAL_DIRECTIONAL_DISK = 1
+
 
 @dataclass(frozen=True)
 class AnalyticDiscretization:
@@ -99,6 +105,7 @@ class AnalyticElement:
     projected_aperture_primitive_index: int = np.iinfo(np.uint32).max
     projected_aperture_hole_index: int = np.iinfo(np.uint32).max
     source_quadrature: bool = True
+    source_visibility: int = SOURCE_VISIBILITY_RAY_TRACED
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,7 @@ class Primitive:
     plus_domain_id: int
     channel_id: int = -1
     surface_element: int = 0
+    source_integral: int = SOURCE_INTEGRAL_NONE
     holes: tuple[tuple[float, float, float], ...] = ()
 
 
@@ -229,6 +237,12 @@ def _area_quadrature_elements(
                     projected_aperture_primitive_index,
                     projected_aperture_hole_index,
                     source_quadrature,
+                    (
+                        SOURCE_VISIBILITY_PROJECTED_APERTURE
+                        if projected_aperture_primitive_index
+                        != np.iinfo(np.uint32).max
+                        else SOURCE_VISIBILITY_DIRECT
+                    ),
                 )
             )
     return result
@@ -329,6 +343,7 @@ def build_analytic_transport(
             GXE_LXE,
             GXE,
             LXE,
+            source_integral=SOURCE_INTEGRAL_DIRECTIONAL_DISK,
         ),
     )
 
@@ -488,6 +503,7 @@ def build_analytic_transport(
                 area,
                 patch,
                 patch,
+                source_visibility=SOURCE_VISIBILITY_DIRECT,
             )
         )
         patch += 1
@@ -526,6 +542,11 @@ def build_analytic_transport(
                         config.aperture_radius_mm * dphi * dz,
                         patch,
                         patch,
+                        projected_aperture_primitive_index=top_primitive,
+                        projected_aperture_hole_index=pmt_index,
+                        source_visibility=(
+                            SOURCE_VISIBILITY_PROJECTED_APERTURE
+                        ),
                     )
                 )
                 patch += 1
@@ -564,6 +585,7 @@ def build_analytic_transport(
                     config.wall_radius_mm * outer_dphi * outer_dz,
                     patch,
                     patch,
+                    source_visibility=SOURCE_VISIBILITY_DIRECT,
                 )
             )
             patch += 1
@@ -622,6 +644,7 @@ def build_analytic_transport(
                         sector_area,
                         patch,
                         patch,
+                        source_visibility=SOURCE_VISIBILITY_DIRECT,
                     )
                 )
                 patch += 1
@@ -702,6 +725,13 @@ def _write_analytic(
         "normal_sign",
         data=np.asarray([value.normal_sign for value in primitives],
                         dtype=np.float64),
+    )
+    analytic.create_dataset(
+        "source_integral",
+        data=np.asarray(
+            [value.source_integral for value in primitives],
+            dtype=np.uint8,
+        ),
     )
     analytic.create_dataset(
         "surface_id",
@@ -808,6 +838,13 @@ def _write_analytic(
         ),
     )
     element_group.create_dataset(
+        "source_visibility",
+        data=np.asarray(
+            [value.source_visibility for value in elements],
+            dtype=np.uint8,
+        ),
+    )
+    element_group.create_dataset(
         "projected_aperture_primitive_index",
         data=np.asarray(
             [
@@ -907,22 +944,35 @@ def build(
                     dtype=np.uint32,
                 ),
             )
-            handle["/geometry"].create_dataset(
-                "triangle_transport",
-                data=np.where(replaced, 0, 1).astype(np.uint8),
-            )
+            handle["/geometry/triangle_transport"][...] = np.where(
+                replaced, 0, 1
+            ).astype(np.uint8)
             # The exact analytic LXe disk owns ray intersection and its
             # 40x80 intrinsic elements own only the return basis.  The
             # canonical triangulation independently partitions the disk for
             # exact-solid-angle adaptive source integration.
-            handle["/geometry"].create_dataset(
-                "triangle_source_quadrature",
-                data=np.where(
-                    replaced,
-                    surfaces == GXE_LXE,
-                    1,
-                ).astype(np.uint8),
+            handle["/geometry/triangle_source_quadrature"][...] = np.where(
+                replaced,
+                surfaces == GXE_LXE,
+                1,
+            ).astype(np.uint8)
+            lxe_analytic_primitive = next(
+                index
+                for index, primitive in enumerate(primitives)
+                if primitive.surface_id == GXE_LXE
+                and primitive.kind == DISK
             )
+            source_replacement = np.full(
+                surfaces.shape,
+                np.iinfo(np.uint32).max,
+                dtype=np.uint32,
+            )
+            source_replacement[surfaces == GXE_LXE] = (
+                lxe_analytic_primitive
+            )
+            handle[
+                "/geometry/triangle_source_analytic_primitive"
+            ][...] = source_replacement
             _write_analytic(handle, primitives, elements)
             metadata = handle["/metadata"]
             metadata.create_dataset(

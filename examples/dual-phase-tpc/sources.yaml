@@ -10,8 +10,11 @@ sources:
       quadrature: gauss_legendre
     angular:
       type: isotropic_surface_shape_factor
+      backend: structured_analytic
       relative_tolerance: 1.0e-5
       maximum_subdivision_depth: 6
       minimum_refinement_solid_angle_fraction: 1.0e-5
       minimum_feature_solid_angle_fraction: 1.0e-8
       feature_dihedral_degrees: 5.0
+      structured_disk_mu_order: 31
+      structured_disk_phi_count: 64

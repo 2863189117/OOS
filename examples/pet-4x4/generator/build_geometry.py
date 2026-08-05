@@ -871,6 +871,9 @@ def write_analytic_anode_wires(
         "normal_sign", data=np.ones(count, dtype=np.float64)
     )
     analytic.create_dataset(
+        "source_integral", data=np.zeros(count, dtype=np.uint8)
+    )
+    analytic.create_dataset(
         "surface_id", data=np.full(count, ANODE_WIRE, dtype=np.uint32)
     )
     analytic.create_dataset(
@@ -938,6 +941,23 @@ def write_geometry(
             geometry.create_dataset(
                 "channel_id",
                 data=np.asarray(mesh.channel_id, dtype=np.int32),
+            )
+            triangle_count = len(mesh.triangles)
+            geometry.create_dataset(
+                "triangle_transport",
+                data=np.ones(triangle_count, dtype=np.uint8),
+            )
+            geometry.create_dataset(
+                "triangle_source_quadrature",
+                data=np.ones(triangle_count, dtype=np.uint8),
+            )
+            geometry.create_dataset(
+                "triangle_source_analytic_primitive",
+                data=np.full(
+                    triangle_count,
+                    np.iinfo(np.uint32).max,
+                    dtype=np.uint32,
+                ),
             )
             metadata = handle.create_group("metadata")
             metadata.create_dataset(

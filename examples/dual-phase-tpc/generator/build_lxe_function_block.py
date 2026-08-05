@@ -73,6 +73,173 @@ def source_digest() -> str:
     return digest.hexdigest()
 
 
+def _update_array_digest(
+    digest: "hashlib._Hash", name: str, values: np.ndarray
+) -> None:
+    array = np.ascontiguousarray(values)
+    digest.update(name.encode())
+    digest.update(array.dtype.str.encode())
+    digest.update(json.dumps(array.shape).encode())
+    digest.update(array.tobytes())
+
+
+def geometry_lxe_contract(
+    path: Path, *, surface_id: int, gxe_domain_id: int
+) -> dict[str, object]:
+    """Return the liquid-only geometry identity used by the LXe block."""
+
+    with h5py.File(path, "r") as handle:
+        generator = json.loads(
+            bytes(handle["/metadata/generator_json"][:]).decode()
+        )
+        config = generator["config"]
+        radius_mm = float(config["active_radius_mm"])
+        depth_mm = float(config["lxe_depth_mm"])
+        digest = hashlib.sha256()
+        digest.update(b"oos.dual-phase-tpc.lxe-geometry.v1\n")
+        digest.update(
+            json.dumps(
+                {
+                    "radius_mm": radius_mm,
+                    "depth_mm": depth_mm,
+                    "surface_id": surface_id,
+                    "gxe_domain_id": gxe_domain_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+        if "/analytic/elements/primitive_index" in handle:
+            primitive_surface = np.asarray(
+                handle["/analytic/surface_id"], dtype=np.uint32
+            )
+            primitive_minus = np.asarray(
+                handle["/analytic/minus_domain_id"], dtype=np.int32
+            )
+            primitive_plus = np.asarray(
+                handle["/analytic/plus_domain_id"], dtype=np.int32
+            )
+            selected_primitives = np.flatnonzero(
+                (primitive_surface == surface_id)
+                & (
+                    (primitive_minus == gxe_domain_id)
+                    ^ (primitive_plus == gxe_domain_id)
+                )
+            )
+            if selected_primitives.size != 1:
+                raise RuntimeError(
+                    "geometry must declare exactly one analytic LXe surface"
+                )
+            primitive = int(selected_primitives[0])
+            kind = int(handle["/analytic/kind"][primitive])
+            parameters = np.asarray(
+                handle["/analytic/parameters"][primitive], dtype=np.float64
+            )
+            if kind != 1 or not math.isclose(
+                float(parameters[0]), radius_mm, rel_tol=0.0, abs_tol=1.0e-9
+            ):
+                raise RuntimeError(
+                    "analytic LXe disk radius disagrees with geometry metadata"
+                )
+            for name in (
+                "kind",
+                "center_mm",
+                "axis_x",
+                "axis_y",
+                "axis_z",
+                "parameters",
+                "normal_sign",
+                "surface_id",
+                "minus_domain_id",
+                "plus_domain_id",
+            ):
+                _update_array_digest(
+                    digest,
+                    f"primitive/{name}",
+                    np.asarray(handle[f"/analytic/{name}"][primitive]),
+                )
+            owner = np.asarray(
+                handle["/analytic/elements/primitive_index"], dtype=np.uint32
+            )
+            selected = np.flatnonzero(owner == primitive)
+            if selected.size == 0:
+                raise RuntimeError("analytic LXe surface has no elements")
+            element_id = np.asarray(
+                handle["/analytic/elements/surface_element"], dtype=np.uint64
+            )[selected]
+            order = np.argsort(element_id)
+            selected = selected[order]
+            if np.unique(element_id).size != element_id.size:
+                raise RuntimeError("analytic LXe surface elements are not unique")
+            for name in (
+                "coordinates",
+                "bounds",
+                "center_mm",
+                "normal",
+                "surface_element",
+            ):
+                _update_array_digest(
+                    digest,
+                    f"elements/{name}",
+                    np.asarray(handle[f"/analytic/elements/{name}"])[selected],
+                )
+            representation = "analytic"
+        else:
+            surface = np.asarray(
+                handle["/geometry/surface_id"], dtype=np.uint32
+            )
+            minus = np.asarray(
+                handle["/geometry/minus_domain_id"], dtype=np.int32
+            )
+            plus = np.asarray(
+                handle["/geometry/plus_domain_id"], dtype=np.int32
+            )
+            selected = np.flatnonzero(
+                (surface == surface_id)
+                & ((minus == gxe_domain_id) ^ (plus == gxe_domain_id))
+            )
+            if selected.size == 0:
+                raise RuntimeError("triangle geometry has no LXe surface")
+            triangles = np.asarray(
+                handle["/geometry/triangles"], dtype=np.uint32
+            )[selected]
+            vertices = np.asarray(
+                handle["/geometry/vertices"], dtype=np.float64
+            )
+            _update_array_digest(digest, "triangle/index", selected)
+            _update_array_digest(digest, "triangle/vertices", vertices[triangles])
+            _update_array_digest(digest, "triangle/minus", minus[selected])
+            _update_array_digest(digest, "triangle/plus", plus[selected])
+            representation = "triangles"
+    return {
+        "schema": "oos.dual-phase-tpc.lxe-geometry.v1",
+        "fingerprint_sha256": digest.hexdigest(),
+        "radius_mm": radius_mm,
+        "depth_mm": depth_mm,
+        "surface_id": surface_id,
+        "gxe_domain_id": gxe_domain_id,
+        "representation": representation,
+    }
+
+
+def apply_test_profile(arguments: argparse.Namespace) -> None:
+    arguments.position_radial_bins = 4
+    arguments.position_phi_bins = 8
+    arguments.direction_mu_bins = 2
+    arguments.direction_phi_bins = 4
+    arguments.surface_radial_order = 40
+    arguments.surface_phi_bins = 80
+    arguments.return_mu_order = 2
+    arguments.return_direction_phi = 4
+    arguments.first_scatter_order = 4
+    arguments.explicit_collision_order = 2
+    arguments.collision_sample_power = 6
+    arguments.collision_maximum_events = 16
+    arguments.azimuthal_maximum = 8
+    arguments.radial_modes = 24
+    arguments.root_samples = 24
+
+
 def refract_direction(
     direction: np.ndarray,
     normal_toward_incident: np.ndarray,
@@ -198,8 +365,7 @@ def locate_surface_points(
     """Map local surface points to intrinsic analytic elements or triangles.
 
     Exact analytic elements are the canonical nonlocal-surface basis when
-    present.  Triangle ordinals remain a compatibility fallback for generic
-    mesh-only scenes.
+    present. Triangle ordinals provide the corresponding generic mesh path.
     """
 
     with h5py.File(geometry, "r") as handle:
@@ -396,18 +562,27 @@ def egress_basis(
     )
 
 
-def cache_key(arguments: argparse.Namespace) -> str:
+def cache_key(
+    arguments: argparse.Namespace, geometry_contract: dict[str, object]
+) -> str:
     material = {
-        "schema": "oos.dual-phase-tpc.lxe-function-generator.v1",
-        "geometry_sha256": sha256(arguments.geometry),
+        "schema": "oos.dual-phase-tpc.lxe-function-generator.v2",
+        "geometry_contract_sha256": geometry_contract[
+            "fingerprint_sha256"
+        ],
         "generator_sha256": source_digest(),
         "parameters": {
             key: value
             for key, value in vars(arguments).items()
-            if key not in {"output", "force"}
+            if key not in {
+                "output",
+                "force",
+                "geometry",
+                "processes",
+                "test",
+            }
         },
     }
-    material["parameters"]["geometry"] = str(arguments.geometry.resolve())
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, default=str).encode()
     ).hexdigest()
@@ -431,8 +606,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--surface-id", type=int, default=1)
     result.add_argument("--gxe-domain-id", type=int, default=0)
     result.add_argument("--geometry-tolerance-mm", type=float, default=1e-8)
-    result.add_argument("--radius-mm", type=float, default=1000.0)
-    result.add_argument("--depth-mm", type=float, default=2000.0)
     result.add_argument("--position-radial-bins", type=int, default=24)
     result.add_argument("--position-phi-bins", type=int, default=72)
     result.add_argument("--direction-mu-bins", type=int, default=4)
@@ -457,13 +630,27 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--azimuthal-maximum", type=int, default=32)
     result.add_argument("--radial-modes", type=int, default=120)
     result.add_argument("--root-samples", type=int, default=120)
+    result.add_argument(
+        "--test",
+        action="store_true",
+        help="use a coarse liquid grid while preserving the egress contract",
+    )
     result.add_argument("--force", action="store_true")
     return result
 
 
 def main() -> None:
     arguments = parser().parse_args()
-    key = cache_key(arguments)
+    geometry_contract = geometry_lxe_contract(
+        arguments.geometry,
+        surface_id=arguments.surface_id,
+        gxe_domain_id=arguments.gxe_domain_id,
+    )
+    arguments.radius_mm = geometry_contract["radius_mm"]
+    arguments.depth_mm = geometry_contract["depth_mm"]
+    if arguments.test:
+        apply_test_profile(arguments)
+    key = cache_key(arguments, geometry_contract)
     if not arguments.force and stored_cache_key(arguments.output) == key:
         print(f"cache hit: {arguments.output}")
         print(f"cache key: {key}")
@@ -543,6 +730,10 @@ def main() -> None:
             **operator.metadata,
             "cache_key_sha256": key,
             "geometry_sha256": sha256(arguments.geometry),
+            "geometry_contract_sha256": geometry_contract[
+                "fingerprint_sha256"
+            ],
+            "geometry_contract": geometry_contract,
             "generator_sha256": source_digest(),
             "surface_phi_bins": arguments.surface_phi_bins,
             "return_mu_order": arguments.return_mu_order,
