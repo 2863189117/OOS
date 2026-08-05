@@ -309,8 +309,14 @@ The canonical hit input is:
 ```text
 /hits/counts       uint64 [Nevent,Nchannel]
 /hits/channel_id   int32  [Nchannel]
+/hits/emitted      optional uint64 [Nevent]
 /hits/truth_xy_mm  optional float64 [Nevent,2]
 ```
+
+When `emitted` is present it must be positive and at least the summed channel
+count for every event. Fits then use `Nchannel` channel outcomes plus the
+no-top-hit outcome; without it they use the conditional top-pattern
+likelihood.
 
 `oos-regress grid` writes:
 
@@ -366,9 +372,26 @@ complete effective-response file and stores it in the optional full-file hash
 field.
 
 The default Cartesian spacing is 10 mm and may be changed with
-`--spacing-mm`. `oos-regress fit --adjoint` additionally writes
+`--spacing-mm`. `oos-regress fit` supports two conceptual modes. The default
+`fast` mode requires only a response grid and interpolates that grid at
+all refinement candidates; `--fit-mode accurate` evaluates refinement
+candidates through the complete effective response matrix. Both modes fit a
+sub-grid quadratic peak only after their finest sampled level and record the
+acceptance decision per event.
+
+`--adjoint` additionally writes the initial coarse-support likelihood as
 `/regression/full_plane_log_likelihood [Nevent,Npoint]`; without `--adjoint`
-only fitted coordinates and best likelihoods are retained.
+only fitted coordinates and best likelihoods are retained. Regression output
+uses schema `oos.regression.v2` and additionally stores:
+
+```text
+/regression/subgrid_interpolated      uint8 [Nevent]
+/regression/likelihood_xy_mm          float64 [Nlikelihood,2], with --adjoint
+/metadata/fit_mode                    string
+/metadata/likelihood                  string
+/metadata/final_sampling_spacing_mm   float64 [1]
+```
+
 Parallel-line fits additionally write
 `/regression/fitted_line_id [Nevent]` and
 `/regression/fitted_line_x_mm [Nevent]`.

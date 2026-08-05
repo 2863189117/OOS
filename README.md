@@ -63,8 +63,21 @@ oos-efficiency calculate operators.h5 --scene scene.yaml \
 oos-regress grid operators.h5 --precomputed effective.h5 \
   --scene scene.yaml --output grid.h5
 
-oos-regress fit --hits hits.h5 --grid grid.h5 --output regression.h5
+oos-regress fit --hits hits.h5 --grid grid.h5 \
+  --output regression-fast.h5
+
+oos-regress fit --fit-mode accurate --hits hits.h5 --grid grid.h5 \
+  --operators operators.h5 --precomputed effective.h5 --scene scene.yaml \
+  --output regression-accurate.h5
 ```
+
+`fast` is the default fit mode. It performs coarse-to-fine MLE entirely on the
+stored response grid and never loads the source tracer or effective response
+matrix. `accurate` uses
+the grid only for its global seed, rebuilds every refinement candidate through
+the source integrator and `effective.h5`, then fits a deterministic local
+quadratic maximum on the finest directly sampled likelihood grid. Invalid or
+non-concave quadratic fits fall back to the finest discrete maximum.
 
 `precompute` constructs the bounded response exclusively through terminal-
 basis adjoint propagation. Function plugins must export

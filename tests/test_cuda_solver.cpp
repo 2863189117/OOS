@@ -252,6 +252,7 @@ TEST_CASE("CUDA adjoint grid likelihood matches CPU scoring") {
   hits.count = 2;
   hits.channels = 2;
   hits.counts = {90, 10, 10, 90};
+  hits.emitted = {1000, 1000};
   hits.channel_ids = {10, 11};
   const auto cpu = oos::score_response_grid_cpu(grid, hits);
   const auto cuda = oos::score_response_grid_cuda(grid, hits);

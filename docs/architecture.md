@@ -55,17 +55,28 @@ Source geometry remains continuous: a newly traced source batch `B` is
 evaluated as `direct + B R_D`, with corresponding losses and unresolved
 weight.
 
-Regression normalizes each response across sensitive channels because emitted
-light yield is a nuisance parameter. A response grid stores
-`log p(channel | x,y)`. Full-plane likelihood is the adjoint dense product
+When `/hits/emitted` is absent, regression normalizes each response across
+sensitive channels because emitted light yield is a nuisance parameter. When
+it is present, both fit modes use the absolute multinomial likelihood with a
+no-top-hit category. A response grid stores both
+`log p(channel | top hit,x,y)` and total top efficiency. Coarse-plane
+likelihood is the adjoint dense product
 
 ```text
 logL[event,xy] = counts[event,channel] * logp[xy,channel]^T
 ```
 
-implemented with native cuBLAS. Without a grid, or after a grid supplies the
-global initial maximum, continuous candidates are rebuilt by the analytic
-shape-factor source integrator and evaluated through `effective.h5`.
+implemented with native cuBLAS. The default `oos-regress fit` fast path then uses
+deterministic piecewise-linear interpolation of absolute channel efficiencies;
+this path has no source-runtime or effective-matrix dependency.
+
+In `--fit-mode accurate`, a grid may supply the global initial maximum, after
+which every continuous candidate is rebuilt by the analytic shape-factor
+source integrator and evaluated through `effective.h5`. Once the finest
+sampled level is complete, centered finite differences fit a local quadratic
+log-likelihood. Its stationary point is accepted only for a negative-definite
+Hessian inside the adjacent finest-grid cell and active source domain;
+otherwise the sampled maximum is retained.
 `SourceTraceRuntime` owns the reusable Embree scene, validated operator view,
 surface/plugin runtimes, domain-boundary candidates, and feature-edge cache.
 Clients construct it once and reuse it across source batches.

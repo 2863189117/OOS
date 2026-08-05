@@ -29,6 +29,10 @@ struct HitBatch {
   std::uint64_t count{};
   std::uint64_t channels{};
   std::vector<std::uint64_t> counts;
+  // Optional emitted-photon count per event.  When present, regression uses
+  // the absolute multinomial likelihood including the no-top-hit category;
+  // otherwise it retains the conditional top-pattern likelihood.
+  std::vector<std::uint64_t> emitted;
   std::vector<std::int32_t> channel_ids;
   std::vector<double> truth_xy_mm;
 };

@@ -904,6 +904,23 @@ HitBatch load_hit_batch_hdf5(const std::filesystem::path& path) {
   result.count = count_dims[0];
   result.channels = count_dims[1];
   result.counts = std::move(counts);
+  if (exists(file, "/hits/emitted")) {
+    auto [emitted, emitted_dims] =
+        read_dataset<std::uint64_t>(file, "/hits/emitted");
+    if (emitted_dims != std::vector<hsize_t>{result.count})
+      throw std::runtime_error("/hits/emitted has incompatible shape");
+    result.emitted = std::move(emitted);
+    for (std::uint64_t event = 0; event < result.count; ++event) {
+      if (result.emitted[event] == 0)
+        throw std::runtime_error("/hits/emitted values must be positive");
+      const auto begin = result.counts.begin() + event * result.channels;
+      const auto top_hits =
+          std::accumulate(begin, begin + result.channels, std::uint64_t{0});
+      if (result.emitted[event] < top_hits)
+        throw std::runtime_error(
+            "/hits/emitted is smaller than observed channel counts");
+    }
+  }
   auto [channel, channel_dims] =
       read_dataset<std::int32_t>(file, "/hits/channel_id");
   if (channel_dims != std::vector<hsize_t>{result.channels})
@@ -1125,19 +1142,33 @@ void save_regression_hdf5(const std::filesystem::path& path,
   if (!result.error_mm.empty())
     write_dataset(file, "/regression/error_mm", result.error_mm,
                   {result.events});
+  if (!result.subgrid_interpolated.empty()) {
+    if (result.subgrid_interpolated.size() != result.events)
+      throw std::runtime_error(
+          "subgrid interpolation flags have incompatible dimensions");
+    write_dataset(file, "/regression/subgrid_interpolated",
+                  result.subgrid_interpolated, {result.events});
+  }
   write_dataset(file, "/regression/channel_id", channel_ids,
                 {channel_ids.size()});
   if (!result.full_plane_log_likelihood.empty()) {
     if (result.likelihood_points == 0 ||
         result.full_plane_log_likelihood.size() !=
-            result.events * result.likelihood_points)
+            result.events * result.likelihood_points ||
+        result.likelihood_xy_mm.size() != result.likelihood_points * 2)
       throw std::runtime_error("full-plane likelihood dimensions are invalid");
     write_dataset(file, "/regression/full_plane_log_likelihood",
                   result.full_plane_log_likelihood,
                   {result.events, result.likelihood_points});
+    write_dataset(file, "/regression/likelihood_xy_mm",
+                  result.likelihood_xy_mm, {result.likelihood_points, 2});
   }
   create_group(file, "/metadata");
-  write_string(file, "/metadata/schema", "oos.regression.v1");
+  write_string(file, "/metadata/schema", "oos.regression.v2");
+  write_string(file, "/metadata/fit_mode", result.fit_mode);
+  write_string(file, "/metadata/likelihood", result.likelihood);
+  write_dataset(file, "/metadata/final_sampling_spacing_mm",
+                std::vector<double>{result.final_sampling_spacing_mm}, {1});
 }
 
 }  // namespace oos

@@ -972,6 +972,8 @@ std::vector<double> score_response_grid_cuda(const ResponseGrid& grid,
   if (hits.channels != grid.channels ||
       hits.channel_ids != grid.channel_ids)
     throw std::runtime_error("hit channels do not match response grid");
+  if (!hits.emitted.empty() && hits.emitted.size() != hits.count)
+    throw std::runtime_error("emitted counts do not match hit events");
   std::vector<double> log_probability(
       grid.conditional_log_probability.begin(),
       grid.conditional_log_probability.end());
@@ -1003,6 +1005,58 @@ std::vector<double> score_response_grid_cuda(const ResponseGrid& grid,
             device_counts.data(), static_cast<int>(grid.channels), &zero,
             device_result.data(), static_cast<int>(grid.points)),
         "score full-plane likelihood");
+    if (!hits.emitted.empty()) {
+      std::vector<double> log_top(grid.points);
+      std::vector<double> log_no_hit(grid.points);
+      for (std::uint64_t point = 0; point < grid.points; ++point) {
+        log_top[point] = std::log(grid.top_efficiency[point]);
+        log_no_hit[point] = std::log1p(-grid.top_efficiency[point]);
+      }
+      std::vector<double> top_hits(hits.count);
+      std::vector<double> no_hits(hits.count);
+      for (std::uint64_t event = 0; event < hits.count; ++event) {
+        const auto begin = hits.counts.begin() + event * hits.channels;
+        const auto observed = std::accumulate(
+            begin, begin + hits.channels, std::uint64_t{0});
+        if (hits.emitted[event] < observed)
+          throw std::runtime_error(
+              "emitted count is smaller than observed top hits");
+        top_hits[event] = static_cast<double>(observed);
+        no_hits[event] = static_cast<double>(hits.emitted[event] - observed);
+      }
+      DeviceBuffer<double> device_log_top(log_top.size());
+      DeviceBuffer<double> device_log_no_hit(log_no_hit.size());
+      DeviceBuffer<double> device_top_hits(top_hits.size());
+      DeviceBuffer<double> device_no_hits(no_hits.size());
+      check_cuda(cudaMemcpy(device_log_top.data(), log_top.data(),
+                            log_top.size() * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "copy top-efficiency log probabilities");
+      check_cuda(cudaMemcpy(device_log_no_hit.data(), log_no_hit.data(),
+                            log_no_hit.size() * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "copy no-hit log probabilities");
+      check_cuda(cudaMemcpy(device_top_hits.data(), top_hits.data(),
+                            top_hits.size() * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "copy observed top-hit counts");
+      check_cuda(cudaMemcpy(device_no_hits.data(), no_hits.data(),
+                            no_hits.size() * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "copy no-hit counts");
+      check_blas(cublasDger(
+                     blas, static_cast<int>(grid.points),
+                     static_cast<int>(hits.count), &one,
+                     device_log_top.data(), 1, device_top_hits.data(), 1,
+                     device_result.data(), static_cast<int>(grid.points)),
+                 "add detected-efficiency likelihood");
+      check_blas(cublasDger(
+                     blas, static_cast<int>(grid.points),
+                     static_cast<int>(hits.count), &one,
+                     device_log_no_hit.data(), 1, device_no_hits.data(), 1,
+                     device_result.data(), static_cast<int>(grid.points)),
+                 "add no-hit likelihood");
+    }
     std::vector<double> result(hits.count * grid.points);
     check_cuda(cudaMemcpy(result.data(), device_result.data(),
                           result.size() * sizeof(double),

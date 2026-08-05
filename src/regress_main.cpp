@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
@@ -48,7 +49,8 @@ void usage() {
          "[--verify-effective-content] "
          "[--surface-basis selection.h5] [--device cpu|cuda]\n"
       << "  oos-regress fit --hits hits.h5 --output regression.h5 "
-         "[--grid grid.h5] [--operators operators.h5 "
+         "[--fit-mode fast|accurate] [--grid grid.h5] "
+         "[--coarse-spacing-mm 50] [--operators operators.h5 "
          "--precomputed effective.h5 --scene scene.yaml] "
          "[--surface-basis selection.h5] [--device cpu|cuda] "
          "[--source-z-mm 2.5] [--source-thickness-mm 5] "
@@ -59,10 +61,10 @@ void usage() {
          "[--source-backend auto|generic_bvh|structured_analytic] "
          "[--structured-disk-mu-order 31] "
          "[--structured-disk-phi-count 64] "
-         "[--refine-spacings-mm 40,5,1,0.25,0.1] "
-         "[--refine-half-widths-mm 160,20,4,1,0.4] "
+         "[--refine-spacings-mm LIST] "
+         "[--refine-half-widths-mm LIST] "
          "[--batch-size auto|N] "
-         "[--grid-only] [--adjoint]\n";
+         "[--adjoint]\n";
 }
 
 std::string option(int argc, char** argv, const std::string& name,
@@ -216,12 +218,15 @@ SearchDomain search_domain_from_grid(const oos::ResponseGrid& grid) {
 }
 
 std::vector<std::pair<double, double>> refinement_levels(
-    int argc, char** argv) {
+    int argc, char** argv, bool fast_mode) {
   const auto spacing_option = option(argc, argv, "--refine-spacings-mm");
   const auto width_option = option(argc, argv, "--refine-half-widths-mm");
   if (spacing_option.empty() != width_option.empty())
     throw std::runtime_error(
         "both refinement spacing and half-width options are required");
+  if (spacing_option.empty() && fast_mode)
+    return {{10.0, 80.0}, {5.0, 10.0}, {1.0, 2.0},
+            {0.25, 0.5}};
   if (spacing_option.empty())
     return {{40.0, 160.0}, {5.0, 20.0}, {1.0, 4.0},
             {0.25, 1.0}, {0.1, 0.4}};
@@ -234,6 +239,63 @@ std::vector<std::pair<double, double>> refinement_levels(
   result.reserve(spacings.size());
   for (std::size_t index = 0; index < spacings.size(); ++index)
     result.emplace_back(spacings[index], widths[index]);
+  return result;
+}
+
+oos::ResponseGrid coarse_response_grid(const oos::ResponseGrid& grid,
+                                       double coarse_spacing_mm) {
+  grid.validate();
+  const double ratio = coarse_spacing_mm / grid.spacing_mm;
+  const auto stride = static_cast<std::int64_t>(std::llround(ratio));
+  if (stride < 1 || std::abs(ratio - stride) > 1.0e-9)
+    throw std::runtime_error(
+        "--coarse-spacing-mm must be an integer multiple of grid spacing");
+  std::vector<std::uint64_t> selected;
+  selected.reserve(grid.points / static_cast<std::uint64_t>(stride * stride) +
+                   1024);
+  for (std::uint64_t point = 0; point < grid.points; ++point) {
+    const double x = grid.xy_mm[2 * point];
+    const double y = grid.xy_mm[2 * point + 1];
+    const auto ix = static_cast<std::int64_t>(
+        std::llround(x / grid.spacing_mm));
+    bool coarse = ix % stride == 0;
+    bool boundary = false;
+    if (grid.domain_shape == "parallel_lines") {
+      boundary = std::abs(x) >= grid.half_x_mm - 1.5 * grid.spacing_mm;
+    } else {
+      const auto iy = static_cast<std::int64_t>(
+          std::llround(y / grid.spacing_mm));
+      coarse = coarse && iy % stride == 0;
+      if (grid.domain_shape == "disk")
+        boundary = std::hypot(x, y) >=
+                   grid.radius_mm - 1.5 * grid.spacing_mm;
+      else
+        boundary =
+            std::abs(x) >= grid.half_x_mm - 1.5 * grid.spacing_mm ||
+            std::abs(y) >= grid.half_y_mm - 1.5 * grid.spacing_mm;
+    }
+    if (coarse || boundary) selected.push_back(point);
+  }
+  oos::ResponseGrid result = grid;
+  result.points = selected.size();
+  result.xy_mm.clear();
+  result.top_efficiency.clear();
+  result.conditional_log_probability.clear();
+  result.xy_mm.reserve(result.points * 2);
+  result.top_efficiency.reserve(result.points);
+  result.conditional_log_probability.reserve(result.points * grid.channels);
+  for (const auto point : selected) {
+    result.xy_mm.push_back(grid.xy_mm[2 * point]);
+    result.xy_mm.push_back(grid.xy_mm[2 * point + 1]);
+    result.top_efficiency.push_back(grid.top_efficiency[point]);
+    const auto begin =
+        grid.conditional_log_probability.begin() + point * grid.channels;
+    result.conditional_log_probability.insert(
+        result.conditional_log_probability.end(), begin,
+        begin + grid.channels);
+  }
+  result.fingerprint_sha256.clear();
+  result.validate();
   return result;
 }
 
@@ -388,27 +450,50 @@ class CandidateEvaluator {
 #endif
 };
 
-double conditional_score(const double* efficiency, std::uint64_t channels,
-                         const std::uint64_t* counts) {
+double observation_score(const double* efficiency, std::uint64_t channels,
+                         const std::uint64_t* counts,
+                         std::uint64_t emitted) {
   const double total =
       std::accumulate(efficiency, efficiency + channels, 0.0);
-  if (!(total > 0.0)) return -std::numeric_limits<double>::infinity();
+  if (!(total > 0.0) || !(total < 1.0))
+    return -std::numeric_limits<double>::infinity();
   double score = 0.0;
-  for (std::uint64_t channel = 0; channel < channels; ++channel)
+  std::uint64_t top_hits = 0;
+  for (std::uint64_t channel = 0; channel < channels; ++channel) {
+    top_hits += counts[channel];
+    const double probability =
+        emitted == 0 ? efficiency[channel] / total : efficiency[channel];
     score += static_cast<double>(counts[channel]) *
-             std::log(std::max(efficiency[channel] / total, 1.0e-15));
+             std::log(std::max(probability, 1.0e-15));
+  }
+  if (emitted != 0) {
+    if (emitted < top_hits)
+      throw std::runtime_error(
+          "emitted count is smaller than observed top hits");
+    score += static_cast<double>(emitted - top_hits) *
+             std::log(std::max(1.0 - total, 1.0e-15));
+  }
   return score;
 }
 
-std::pair<std::vector<double>, double> maximize_candidates(
+struct CandidateMaximum {
+  std::vector<double> xy_mm;
+  double score{-std::numeric_limits<double>::infinity()};
+  std::uint64_t best_index{};
+  std::vector<double> sampled_scores;
+};
+
+CandidateMaximum maximize_candidates(
     CandidateEvaluator& evaluator, const std::vector<double>& xy_mm,
     const std::uint64_t* counts, std::uint64_t channels,
-    std::uint64_t batch_size) {
+    std::uint64_t emitted, std::uint64_t batch_size, bool retain_scores) {
   const auto points = static_cast<std::uint64_t>(xy_mm.size() / 2);
   if (batch_size == 0)
     throw std::runtime_error("--batch-size must be positive");
-  std::uint64_t best = 0;
-  double best_score = -std::numeric_limits<double>::infinity();
+  CandidateMaximum result;
+  if (retain_scores)
+    result.sampled_scores.assign(
+        points, -std::numeric_limits<double>::infinity());
   for (std::uint64_t start = 0; start < points; start += batch_size) {
     const auto stop = std::min(points, start + batch_size);
     const std::vector<double> batch(xy_mm.begin() + 2 * start,
@@ -416,23 +501,35 @@ std::pair<std::vector<double>, double> maximize_candidates(
     const auto response = evaluator.evaluate(batch);
     for (std::uint64_t point = start; point < stop; ++point) {
       const auto local = point - start;
-      const double score = conditional_score(
-          response.efficiency.data() + local * channels, channels, counts);
-      if (score > best_score) {
-        best_score = score;
-        best = point;
+      const double score = observation_score(
+          response.efficiency.data() + local * channels, channels, counts,
+          emitted);
+      if (retain_scores) result.sampled_scores[point] = score;
+      if (score > result.score) {
+        result.score = score;
+        result.best_index = point;
       }
     }
   }
-  return {{xy_mm[2 * best], xy_mm[2 * best + 1]}, best_score};
+  if (!std::isfinite(result.score))
+    throw std::runtime_error("all matrix refinement candidates were invalid");
+  result.xy_mm = {xy_mm[2 * result.best_index],
+                  xy_mm[2 * result.best_index + 1]};
+  return result;
 }
 
-void refine_events(CandidateEvaluator& evaluator, const oos::HitBatch& hits,
-                   const SearchDomain& domain,
-                   const std::vector<std::pair<double, double>>& levels,
-                   bool preserve_large_disk_edge_search,
-                   std::uint64_t batch_size,
-                   oos::RegressionResult& result) {
+void refine_events_accurate(
+    CandidateEvaluator& evaluator, const oos::HitBatch& hits,
+    const SearchDomain& domain,
+    const std::vector<std::pair<double, double>>& levels,
+    bool preserve_large_disk_edge_search, std::uint64_t batch_size,
+    oos::RegressionResult& result) {
+  if (levels.empty()) throw std::runtime_error("refinement levels are empty");
+  result.subgrid_interpolated.assign(hits.count, 0);
+  result.fit_mode = "accurate_matrix";
+  result.likelihood = hits.emitted.empty() ? "conditional_multinomial"
+                                           : "absolute_multinomial";
+  result.final_sampling_spacing_mm = levels.back().first;
   for (std::uint64_t event = 0; event < hits.count; ++event) {
     double center_x = result.fitted_xy_mm[2 * event];
     double center_y = result.fitted_xy_mm[2 * event + 1];
@@ -442,18 +539,33 @@ void refine_events(CandidateEvaluator& evaluator, const oos::HitBatch& hits,
         std::hypot(center_x, center_y) >= 850.0 &&
         !event_levels.empty())
       event_levels.front().second = 400.0;
-    for (const auto& [spacing, half_width] : event_levels) {
+    for (std::size_t level = 0; level < event_levels.size(); ++level) {
+      const auto [spacing, half_width] = event_levels[level];
       auto points =
           local_grid(center_x, center_y, spacing, half_width, domain);
       if (points.empty())
         throw std::runtime_error(
             "continuous refinement produced no in-domain candidates");
+      const bool final_level = level + 1 == event_levels.size();
       const auto fitted = maximize_candidates(
           evaluator, points, hits.counts.data() + event * hits.channels,
-          hits.channels, batch_size);
-      center_x = fitted.first[0];
-      center_y = fitted.first[1];
-      score = fitted.second;
+          hits.channels,
+          hits.emitted.empty() ? 0 : hits.emitted[event], batch_size,
+          final_level);
+      center_x = fitted.xy_mm[0];
+      center_y = fitted.xy_mm[1];
+      score = fitted.score;
+      if (final_level) {
+        const auto peak = oos::fit_local_quadratic_peak(
+            points, fitted.sampled_scores, fitted.best_index, spacing,
+            domain.shape == "parallel_lines");
+        if (peak.interpolated && domain.contains(peak.x_mm, peak.y_mm)) {
+          center_x = peak.x_mm;
+          center_y = peak.y_mm;
+          score = peak.log_likelihood;
+          result.subgrid_interpolated[event] = 1;
+        }
+      }
     }
     result.fitted_xy_mm[2 * event] = center_x;
     result.fitted_xy_mm[2 * event + 1] = center_y;
@@ -470,6 +582,90 @@ void refine_events(CandidateEvaluator& evaluator, const oos::HitBatch& hits,
       result.error_mm[event] = std::hypot(dx, dy);
     }
   }
+}
+
+void refine_events_fast(
+    const oos::ResponseGrid& grid, const oos::HitBatch& hits,
+    const SearchDomain& domain,
+    const std::vector<std::pair<double, double>>& levels,
+    oos::RegressionResult& result) {
+  if (levels.empty()) throw std::runtime_error("refinement levels are empty");
+  oos::ResponseGridInterpolator interpolator(grid);
+  result.subgrid_interpolated.assign(hits.count, 0);
+  result.fit_mode = "fast_grid_interpolated";
+  result.likelihood = hits.emitted.empty() ? "conditional_multinomial"
+                                           : "absolute_multinomial";
+  result.final_sampling_spacing_mm = levels.back().first;
+  std::atomic<bool> invalid_candidates{false};
+#pragma omp parallel for schedule(dynamic)
+  for (std::int64_t signed_event = 0;
+       signed_event < static_cast<std::int64_t>(hits.count);
+       ++signed_event) {
+    const auto event = static_cast<std::uint64_t>(signed_event);
+    if (invalid_candidates.load(std::memory_order_relaxed)) continue;
+    double center_x = result.fitted_xy_mm[2 * event];
+    double center_y = result.fitted_xy_mm[2 * event + 1];
+    double score = result.log_likelihood[event];
+    for (std::size_t level = 0; level < levels.size(); ++level) {
+      const auto [spacing, half_width] = levels[level];
+      const auto points =
+          local_grid(center_x, center_y, spacing, half_width, domain);
+      if (points.empty()) {
+        invalid_candidates.store(true, std::memory_order_relaxed);
+        break;
+      }
+      const auto point_count = points.size() / 2;
+      std::vector<double> sampled(
+          point_count, -std::numeric_limits<double>::infinity());
+      std::uint64_t best = 0;
+      double best_score = -std::numeric_limits<double>::infinity();
+      for (std::uint64_t point = 0; point < point_count; ++point) {
+        sampled[point] = interpolator.score(
+            points[2 * point], points[2 * point + 1],
+            hits.counts.data() + event * hits.channels,
+            hits.emitted.empty() ? 0 : hits.emitted[event]);
+        if (sampled[point] > best_score) {
+          best_score = sampled[point];
+          best = point;
+        }
+      }
+      if (!std::isfinite(best_score)) {
+        invalid_candidates.store(true, std::memory_order_relaxed);
+        break;
+      }
+      center_x = points[2 * best];
+      center_y = points[2 * best + 1];
+      score = best_score;
+      if (level + 1 == levels.size()) {
+        const auto peak = oos::fit_local_quadratic_peak(
+            points, sampled, best, spacing,
+            domain.shape == "parallel_lines");
+        if (peak.interpolated && domain.contains(peak.x_mm, peak.y_mm)) {
+          center_x = peak.x_mm;
+          center_y = peak.y_mm;
+          score = peak.log_likelihood;
+          result.subgrid_interpolated[event] = 1;
+        }
+      }
+    }
+    result.fitted_xy_mm[2 * event] = center_x;
+    result.fitted_xy_mm[2 * event + 1] = center_y;
+    if (!result.fitted_line_id.empty()) {
+      result.fitted_line_id[event] =
+          static_cast<std::int32_t>(std::llround(
+              (center_y - domain.line_y_start) / domain.line_pitch));
+      result.fitted_line_x_mm[event] = center_x;
+    }
+    result.log_likelihood[event] = score;
+    if (!hits.truth_xy_mm.empty()) {
+      const double dx = center_x - hits.truth_xy_mm[2 * event];
+      const double dy = center_y - hits.truth_xy_mm[2 * event + 1];
+      result.error_mm[event] = std::hypot(dx, dy);
+    }
+  }
+  if (invalid_candidates.load())
+    throw std::runtime_error(
+        "fast refinement encountered candidates outside grid support");
 }
 
 oos::RegressionResult centroid_initial(const oos::Scene& scene,
@@ -665,27 +861,41 @@ int main(int argc, char** argv) {
       if (hits_path.empty() || output.empty())
         throw std::runtime_error("--hits and --output are required");
       const auto hits = oos::load_hit_batch_hdf5(hits_path);
+      const auto fit_mode = option(argc, argv, "--fit-mode", "fast");
+      if (fit_mode != "accurate" && fit_mode != "fast")
+        throw std::runtime_error("--fit-mode must be accurate or fast");
       oos::RegressionResult result;
       const auto grid_path = option(argc, argv, "--grid");
       std::unique_ptr<CandidateEvaluator> evaluator;
+      std::unique_ptr<oos::ResponseGrid> response_grid;
       auto domain = search_domain_from_arguments(argc, argv);
       if (!grid_path.empty()) {
-        const auto grid = oos::load_response_grid_hdf5(grid_path);
+        response_grid = std::make_unique<oos::ResponseGrid>(
+            oos::load_response_grid_hdf5(grid_path));
+        const double coarse_spacing =
+            std::stod(option(argc, argv, "--coarse-spacing-mm", "50"));
+        const auto coarse_grid =
+            coarse_response_grid(*response_grid, coarse_spacing);
         std::vector<double> scores;
         if (device == "cpu")
-          scores = oos::score_response_grid_cpu(grid, hits);
+          scores = oos::score_response_grid_cpu(coarse_grid, hits);
         else {
 #ifdef OOS_HAS_CUDA
-          scores = oos::score_response_grid_cuda(grid, hits);
+          scores = oos::score_response_grid_cuda(coarse_grid, hits);
 #else
           throw std::runtime_error("this build has no CUDA backend");
 #endif
         }
         result = oos::fit_response_grid_scores(
-            grid, hits, std::move(scores), flag(argc, argv, "--adjoint"));
-        domain = search_domain_from_grid(grid);
+            coarse_grid, hits, std::move(scores), flag(argc, argv, "--adjoint"));
+        domain = search_domain_from_grid(*response_grid);
       }
-      if (grid_path.empty() || !flag(argc, argv, "--grid-only")) {
+      if (fit_mode == "fast") {
+        if (!response_grid)
+          throw std::runtime_error("fast fit mode requires --grid");
+        refine_events_fast(*response_grid, hits, domain,
+                           refinement_levels(argc, argv, true), result);
+      } else {
         const auto operator_path = option(argc, argv, "--operators");
         const auto precomputed = option(argc, argv, "--precomputed");
         const auto scene_path = option(argc, argv, "--scene");
@@ -746,10 +956,10 @@ int main(int argc, char** argv) {
         const bool default_refinement =
             option(argc, argv, "--refine-spacings-mm").empty() &&
             option(argc, argv, "--refine-half-widths-mm").empty();
-        refine_events(*evaluator, hits, domain,
-                      refinement_levels(argc, argv), default_refinement,
-                      batch_size,
-                      result);
+        refine_events_accurate(
+            *evaluator, hits, domain,
+            refinement_levels(argc, argv, false), default_refinement,
+            batch_size, result);
       }
       auto temporary = std::filesystem::path(output);
       temporary += ".tmp";

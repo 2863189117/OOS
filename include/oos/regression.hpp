@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -57,7 +58,50 @@ struct RegressionResult {
   std::vector<double> log_likelihood;
   std::vector<double> error_mm;
   std::vector<double> full_plane_log_likelihood;
+  std::vector<double> likelihood_xy_mm;
   std::uint64_t likelihood_points{};
+  std::vector<std::uint8_t> subgrid_interpolated;
+  std::string fit_mode{"unknown"};
+  std::string likelihood{"conditional_multinomial"};
+  double final_sampling_spacing_mm{};
+};
+
+struct LocalQuadraticPeak {
+  double x_mm{};
+  double y_mm{};
+  double log_likelihood{};
+  bool interpolated{};
+};
+
+// Fit the stationary point of the local quadratic defined by centered finite
+// differences around a sampled maximum.  Missing neighbours, a non-concave
+// Hessian, or a stationary point outside the adjacent finest-grid cell all
+// produce the deterministic discrete fallback.
+LocalQuadraticPeak fit_local_quadratic_peak(
+    const std::vector<double>& xy_mm, const std::vector<double>& values,
+    std::uint64_t best_index, double spacing_mm,
+    bool one_dimensional = false);
+
+// Piecewise-linear interpolation of a regular response grid.  The
+// interpolator reconstructs absolute per-channel efficiencies from the
+// stored conditional probabilities and total efficiency.  It never invokes
+// source tracing or an effective response matrix.
+class ResponseGridInterpolator {
+ public:
+  explicit ResponseGridInterpolator(const ResponseGrid& grid);
+  ~ResponseGridInterpolator();
+  ResponseGridInterpolator(ResponseGridInterpolator&&) noexcept;
+  ResponseGridInterpolator& operator=(ResponseGridInterpolator&&) noexcept;
+  ResponseGridInterpolator(const ResponseGridInterpolator&) = delete;
+  ResponseGridInterpolator& operator=(const ResponseGridInterpolator&) =
+      delete;
+
+  double score(double x_mm, double y_mm, const std::uint64_t* counts,
+               std::uint64_t emitted = 0) const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 std::vector<double> cartesian_disk_grid(double radius_mm,

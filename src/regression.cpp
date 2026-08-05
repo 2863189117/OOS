@@ -7,11 +7,13 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace oos {
 namespace {
@@ -66,7 +68,312 @@ Vec3 reference_axis(const Vec3& direction) {
   return {direction.z / norm, 0.0, -direction.x / norm};
 }
 
+struct GridKey {
+  std::int64_t x{};
+  std::int64_t y{};
+
+  bool operator==(const GridKey& other) const {
+    return x == other.x && y == other.y;
+  }
+};
+
+struct GridKeyHash {
+  std::size_t operator()(const GridKey& key) const {
+    const auto first = std::hash<std::int64_t>{}(key.x);
+    const auto second = std::hash<std::int64_t>{}(key.y);
+    return first ^ (second + 0x9e3779b97f4a7c15ull + (first << 6u) +
+                    (first >> 2u));
+  }
+};
+
+struct VertexBlend {
+  std::array<std::uint64_t, 3> index{};
+  std::array<double, 3> weight{};
+  std::uint32_t count{};
+};
+
+bool barycentric_triangle(
+    double x, double y, const std::array<std::array<double, 2>, 3>& vertex,
+    std::array<double, 3>& weight) {
+  const double denominator =
+      (vertex[1][1] - vertex[2][1]) *
+          (vertex[0][0] - vertex[2][0]) +
+      (vertex[2][0] - vertex[1][0]) *
+          (vertex[0][1] - vertex[2][1]);
+  if (std::abs(denominator) <= 1.0e-18) return false;
+  weight[0] =
+      ((vertex[1][1] - vertex[2][1]) * (x - vertex[2][0]) +
+       (vertex[2][0] - vertex[1][0]) * (y - vertex[2][1])) /
+      denominator;
+  weight[1] =
+      ((vertex[2][1] - vertex[0][1]) * (x - vertex[2][0]) +
+       (vertex[0][0] - vertex[2][0]) * (y - vertex[2][1])) /
+      denominator;
+  weight[2] = 1.0 - weight[0] - weight[1];
+  constexpr double tolerance = 1.0e-10;
+  return std::all_of(weight.begin(), weight.end(), [](double value) {
+    return value >= -tolerance && value <= 1.0 + tolerance;
+  });
+}
+
 }  // namespace
+
+LocalQuadraticPeak fit_local_quadratic_peak(
+    const std::vector<double>& xy_mm, const std::vector<double>& values,
+    std::uint64_t best_index, double spacing_mm, bool one_dimensional) {
+  if (values.empty() || xy_mm.size() != values.size() * 2 ||
+      best_index >= values.size() || !(spacing_mm > 0.0) ||
+      !std::isfinite(spacing_mm))
+    throw std::runtime_error("invalid sampled likelihood surface");
+  LocalQuadraticPeak result{xy_mm[2 * best_index],
+                            xy_mm[2 * best_index + 1], values[best_index],
+                            false};
+  const double x0 = result.x_mm;
+  const double y0 = result.y_mm;
+  const double f0 = result.log_likelihood;
+  const double coordinate_tolerance =
+      std::max(1.0e-10, spacing_mm * 1.0e-8);
+  const auto sampled = [&](double x, double y, double& value) {
+    for (std::uint64_t index = 0; index < values.size(); ++index)
+      if (std::abs(xy_mm[2 * index] - x) <= coordinate_tolerance &&
+          std::abs(xy_mm[2 * index + 1] - y) <= coordinate_tolerance) {
+        value = values[index];
+        return std::isfinite(value);
+      }
+    return false;
+  };
+  double fx_minus{}, fx_plus{};
+  if (!sampled(x0 - spacing_mm, y0, fx_minus) ||
+      !sampled(x0 + spacing_mm, y0, fx_plus))
+    return result;
+  const double inverse_two_h = 0.5 / spacing_mm;
+  const double inverse_h2 = 1.0 / (spacing_mm * spacing_mm);
+  const double gradient_x = (fx_plus - fx_minus) * inverse_two_h;
+  const double hessian_xx = (fx_plus - 2.0 * f0 + fx_minus) * inverse_h2;
+  const double curvature_tolerance =
+      64.0 * std::numeric_limits<double>::epsilon() *
+      std::max(1.0, std::abs(f0)) * inverse_h2;
+  if (one_dimensional) {
+    if (!(hessian_xx < -curvature_tolerance)) return result;
+    const double dx = -gradient_x / hessian_xx;
+    if (!std::isfinite(dx) || std::abs(dx) > spacing_mm) return result;
+    const double fitted =
+        f0 + gradient_x * dx + 0.5 * hessian_xx * dx * dx;
+    if (!std::isfinite(fitted) || fitted < f0) return result;
+    return {x0 + dx, y0, fitted, true};
+  }
+
+  double fy_minus{}, fy_plus{}, fmm{}, fmp{}, fpm{}, fpp{};
+  if (!sampled(x0, y0 - spacing_mm, fy_minus) ||
+      !sampled(x0, y0 + spacing_mm, fy_plus) ||
+      !sampled(x0 - spacing_mm, y0 - spacing_mm, fmm) ||
+      !sampled(x0 - spacing_mm, y0 + spacing_mm, fmp) ||
+      !sampled(x0 + spacing_mm, y0 - spacing_mm, fpm) ||
+      !sampled(x0 + spacing_mm, y0 + spacing_mm, fpp))
+    return result;
+  const double gradient_y = (fy_plus - fy_minus) * inverse_two_h;
+  const double hessian_yy = (fy_plus - 2.0 * f0 + fy_minus) * inverse_h2;
+  const double hessian_xy =
+      (fpp - fpm - fmp + fmm) * 0.25 * inverse_h2;
+  const double determinant =
+      hessian_xx * hessian_yy - hessian_xy * hessian_xy;
+  if (!(hessian_xx < -curvature_tolerance) ||
+      !(hessian_yy < -curvature_tolerance) ||
+      !(determinant > curvature_tolerance * curvature_tolerance))
+    return result;
+  const double dx =
+      (hessian_xy * gradient_y - hessian_yy * gradient_x) / determinant;
+  const double dy =
+      (hessian_xy * gradient_x - hessian_xx * gradient_y) / determinant;
+  if (!std::isfinite(dx) || !std::isfinite(dy) ||
+      std::abs(dx) > spacing_mm || std::abs(dy) > spacing_mm)
+    return result;
+  const double fitted =
+      f0 + gradient_x * dx + gradient_y * dy +
+      0.5 * (hessian_xx * dx * dx +
+             2.0 * hessian_xy * dx * dy + hessian_yy * dy * dy);
+  if (!std::isfinite(fitted) || fitted < f0) return result;
+  return {x0 + dx, y0 + dy, fitted, true};
+}
+
+struct ResponseGridInterpolator::Impl {
+  explicit Impl(const ResponseGrid& source) : grid(source) {
+    grid.validate();
+    absolute_efficiency.resize(grid.points * grid.channels);
+    lattice.reserve(static_cast<std::size_t>(grid.points * 1.3));
+    for (std::uint64_t point = 0; point < grid.points; ++point) {
+      const double scaled_x = grid.xy_mm[2 * point] / grid.spacing_mm;
+      double scaled_y = grid.xy_mm[2 * point + 1] / grid.spacing_mm;
+      if (grid.domain_shape == "parallel_lines")
+        scaled_y = (grid.xy_mm[2 * point + 1] - grid.line_y_start_mm) /
+                   grid.line_pitch_mm;
+      const auto ix = static_cast<std::int64_t>(std::llround(scaled_x));
+      const auto iy = static_cast<std::int64_t>(std::llround(scaled_y));
+      if (std::abs(scaled_x - ix) > 1.0e-8 ||
+          std::abs(scaled_y - iy) > 1.0e-8 ||
+          !lattice.emplace(GridKey{ix, iy}, point).second)
+        throw std::runtime_error(
+            "response grid is not a unique regular lattice");
+      const auto offset = point * grid.channels;
+      for (std::uint64_t channel = 0; channel < grid.channels; ++channel)
+        absolute_efficiency[offset + channel] = static_cast<float>(
+            grid.top_efficiency[point] *
+            std::exp(static_cast<double>(
+                grid.conditional_log_probability[offset + channel])));
+    }
+  }
+
+  bool blend(double x_mm, double y_mm, VertexBlend& result) const {
+    if (!std::isfinite(x_mm) || !std::isfinite(y_mm)) return false;
+    const double gx = x_mm / grid.spacing_mm;
+    double gy = y_mm / grid.spacing_mm;
+    if (grid.domain_shape == "parallel_lines") {
+      gy = (y_mm - grid.line_y_start_mm) / grid.line_pitch_mm;
+      const auto line = static_cast<std::int64_t>(std::llround(gy));
+      if (std::abs(gy - line) > 1.0e-8) return false;
+      const auto rounded_x = static_cast<std::int64_t>(std::llround(gx));
+      const auto exact = lattice.find({rounded_x, line});
+      if (std::abs(gx - rounded_x) <= 1.0e-10 && exact != lattice.end()) {
+        result.index[0] = exact->second;
+        result.weight[0] = 1.0;
+        result.count = 1;
+        return true;
+      }
+      const auto left_x = static_cast<std::int64_t>(std::floor(gx));
+      const auto left = lattice.find({left_x, line});
+      const auto right = lattice.find({left_x + 1, line});
+      if (left == lattice.end() || right == lattice.end()) return false;
+      const double fraction = gx - left_x;
+      result.index = {left->second, right->second, 0};
+      result.weight = {1.0 - fraction, fraction, 0.0};
+      result.count = 2;
+      return true;
+    }
+
+    const auto rounded_x = static_cast<std::int64_t>(std::llround(gx));
+    const auto rounded_y = static_cast<std::int64_t>(std::llround(gy));
+    const auto exact = lattice.find({rounded_x, rounded_y});
+    if (std::abs(gx - rounded_x) <= 1.0e-10 &&
+        std::abs(gy - rounded_y) <= 1.0e-10 && exact != lattice.end()) {
+      result.index[0] = exact->second;
+      result.weight[0] = 1.0;
+      result.count = 1;
+      return true;
+    }
+    const auto ix = static_cast<std::int64_t>(std::floor(gx));
+    const auto iy = static_cast<std::int64_t>(std::floor(gy));
+    const std::array<GridKey, 4> keys{{{ix, iy},
+                                       {ix + 1, iy},
+                                       {ix, iy + 1},
+                                       {ix + 1, iy + 1}}};
+    std::array<std::uint64_t, 4> indices{};
+    std::array<bool, 4> present{};
+    for (std::uint32_t corner = 0; corner < 4; ++corner) {
+      const auto found = lattice.find(keys[corner]);
+      present[corner] = found != lattice.end();
+      if (present[corner]) indices[corner] = found->second;
+    }
+    // Deterministic lower-left to upper-right diagonal, followed by the two
+    // alternate boundary triangles needed by clipped disk cells.
+    constexpr std::array<std::array<std::uint32_t, 3>, 4> triangles{{
+        {{0, 1, 3}}, {{0, 3, 2}}, {{0, 1, 2}}, {{1, 3, 2}}}};
+    for (const auto& triangle : triangles) {
+      if (!present[triangle[0]] || !present[triangle[1]] ||
+          !present[triangle[2]])
+        continue;
+      std::array<std::array<double, 2>, 3> vertex{};
+      for (std::uint32_t item = 0; item < 3; ++item)
+        vertex[item] = {static_cast<double>(keys[triangle[item]].x),
+                        static_cast<double>(keys[triangle[item]].y)};
+      std::array<double, 3> weight{};
+      if (!barycentric_triangle(gx, gy, vertex, weight)) continue;
+      for (std::uint32_t item = 0; item < 3; ++item)
+        result.index[item] = indices[triangle[item]];
+      result.weight = weight;
+      result.count = 3;
+      return true;
+    }
+    return false;
+  }
+
+  double score(double x_mm, double y_mm, const std::uint64_t* counts,
+               std::uint64_t emitted) const {
+    VertexBlend vertices;
+    if (!blend(x_mm, y_mm, vertices))
+      return -std::numeric_limits<double>::infinity();
+    if (vertices.count == 1) {
+      const auto point = vertices.index[0];
+      double value = 0.0;
+      std::uint64_t top_hits = 0;
+      for (std::uint64_t channel = 0; channel < grid.channels; ++channel) {
+        top_hits += counts[channel];
+        value += static_cast<double>(counts[channel]) *
+                 static_cast<double>(grid.conditional_log_probability[
+                     point * grid.channels + channel]);
+      }
+      if (emitted != 0) {
+        if (emitted < top_hits)
+          throw std::runtime_error(
+              "emitted count is smaller than observed top hits");
+        const double total = grid.top_efficiency[point];
+        value += static_cast<double>(top_hits) * std::log(total) +
+                 static_cast<double>(emitted - top_hits) *
+                     std::log1p(-total);
+      }
+      return value;
+    }
+    double total_efficiency = 0.0;
+    for (std::uint32_t item = 0; item < vertices.count; ++item)
+      total_efficiency += vertices.weight[item] *
+                          grid.top_efficiency[vertices.index[item]];
+    if (!(total_efficiency > 0.0) || !(total_efficiency < 1.0))
+      return -std::numeric_limits<double>::infinity();
+    constexpr double probability_floor = 1.0e-15;
+    double value = 0.0;
+    std::uint64_t top_hits = 0;
+    for (std::uint64_t channel = 0; channel < grid.channels; ++channel) {
+      double efficiency = 0.0;
+      for (std::uint32_t item = 0; item < vertices.count; ++item)
+        efficiency +=
+            vertices.weight[item] *
+            absolute_efficiency[vertices.index[item] * grid.channels +
+                                channel];
+      top_hits += counts[channel];
+      const double probability =
+          emitted == 0 ? efficiency / total_efficiency : efficiency;
+      value += static_cast<double>(counts[channel]) *
+               std::log(std::max(probability, probability_floor));
+    }
+    if (emitted != 0) {
+      if (emitted < top_hits)
+        throw std::runtime_error(
+            "emitted count is smaller than observed top hits");
+      value += static_cast<double>(emitted - top_hits) *
+               std::log(std::max(1.0 - total_efficiency,
+                                 probability_floor));
+    }
+    return value;
+  }
+
+  const ResponseGrid& grid;
+  std::vector<float> absolute_efficiency;
+  std::unordered_map<GridKey, std::uint64_t, GridKeyHash> lattice;
+};
+
+ResponseGridInterpolator::ResponseGridInterpolator(const ResponseGrid& grid)
+    : impl_(std::make_unique<Impl>(grid)) {}
+
+ResponseGridInterpolator::~ResponseGridInterpolator() = default;
+ResponseGridInterpolator::ResponseGridInterpolator(
+    ResponseGridInterpolator&&) noexcept = default;
+ResponseGridInterpolator& ResponseGridInterpolator::operator=(
+    ResponseGridInterpolator&&) noexcept = default;
+
+double ResponseGridInterpolator::score(double x_mm, double y_mm,
+                                       const std::uint64_t* counts,
+                                       std::uint64_t emitted) const {
+  return impl_->score(x_mm, y_mm, counts, emitted);
+}
 
 std::string response_grid_fingerprint(const ResponseGrid& grid) {
   std::ostringstream material;
@@ -383,10 +690,25 @@ std::vector<double> score_response_grid_cpu(const ResponseGrid& grid,
   if (hits.channels != grid.channels ||
       hits.channel_ids != grid.channel_ids)
     throw std::runtime_error("hit channels do not match response grid");
+  if (!hits.emitted.empty() && hits.emitted.size() != hits.count)
+    throw std::runtime_error("emitted counts do not match hit events");
+  if (!hits.emitted.empty())
+    for (std::uint64_t event = 0; event < hits.count; ++event) {
+      const auto begin = hits.counts.begin() + event * hits.channels;
+      const auto top_hits =
+          std::accumulate(begin, begin + hits.channels, std::uint64_t{0});
+      if (hits.emitted[event] < top_hits)
+        throw std::runtime_error(
+            "emitted count is smaller than observed top hits");
+    }
   std::vector<double> result(hits.count * grid.points, 0.0);
 #pragma omp parallel for schedule(static)
   for (std::int64_t event = 0;
        event < static_cast<std::int64_t>(hits.count); ++event) {
+    const auto count_offset = static_cast<std::uint64_t>(event) * grid.channels;
+    const auto top_hits = std::accumulate(
+        hits.counts.begin() + count_offset,
+        hits.counts.begin() + count_offset + grid.channels, std::uint64_t{0});
     for (std::uint64_t point = 0; point < grid.points; ++point) {
       double value = 0.0;
       for (std::uint64_t channel = 0; channel < grid.channels; ++channel)
@@ -395,6 +717,12 @@ std::vector<double> score_response_grid_cpu(const ResponseGrid& grid,
                          point * grid.channels + channel]) *
                  static_cast<double>(
                      hits.counts[event * grid.channels + channel]);
+      if (!hits.emitted.empty()) {
+        const double total = grid.top_efficiency[point];
+        value += static_cast<double>(top_hits) * std::log(total) +
+                 static_cast<double>(hits.emitted[event] - top_hits) *
+                     std::log1p(-total);
+      }
       result[event * grid.points + point] = value;
     }
   }
@@ -416,6 +744,9 @@ RegressionResult fit_response_grid_scores(
     throw std::runtime_error("likelihood map dimensions are invalid");
   RegressionResult result;
   result.events = hits.count;
+  result.fit_mode = "grid_discrete";
+  result.likelihood = hits.emitted.empty() ? "conditional_multinomial"
+                                           : "absolute_multinomial";
   result.fitted_xy_mm.resize(hits.count * 2);
   if (grid.domain_shape == "parallel_lines") {
     result.fitted_line_id.resize(hits.count);
@@ -448,6 +779,7 @@ RegressionResult fit_response_grid_scores(
   }
   if (retain_full_plane) {
     result.full_plane_log_likelihood = std::move(likelihood);
+    result.likelihood_xy_mm = grid.xy_mm;
     result.likelihood_points = grid.points;
   }
   return result;
