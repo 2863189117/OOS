@@ -93,8 +93,8 @@ numerics:
   ray_origin_offset_mm: 0.01
   energy_tolerance: 1.0e-10
   neumann_tolerance: 1.0e-10
-  # Modest deterministic boundary quadrature for the public example.
-  lambertian_mu2_order: 4
-  lambertian_phi_count: 24
+  # Production deterministic boundary quadrature.
+  lambertian_mu2_order: 12
+  lambertian_phi_count: 72
   maximum_specular_hits: 64
   maximum_diffuse_bounces: 256
