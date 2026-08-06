@@ -19,6 +19,9 @@ SOURCE_LXE_Z_MAX_MM = 17.5
 WIRE_Y_START_MM = -33.5
 WIRE_PITCH_MM = 1.0
 WIRE_COUNT = 68
+SOURCE_BACKEND = "generic_bvh"
+PRECOMPUTE_BATCH_SIZE = 64
+GRID_BATCH_SIZE = 16
 
 
 def run(command: list[str]) -> None:
@@ -95,6 +98,8 @@ def main() -> None:
             str(effective),
             "--cycles",
             str(arguments.cycles),
+            "--batch-size",
+            str(PRECOMPUTE_BATCH_SIZE),
             "--device",
             "cpu",
         ]
@@ -145,6 +150,8 @@ def main() -> None:
             str(SOURCE_DISTANCE_MAX_MM),
             "--source-angular-mode",
             "rectangular_line_neighborhood_isotropic_product",
+            "--source-backend",
+            SOURCE_BACKEND,
             "--source-transverse-count",
             str(arguments.source_transverse_count),
             "--obstacle-half-width-mm",
@@ -158,7 +165,7 @@ def main() -> None:
             "--source-phi-count",
             str(arguments.source_phi_count),
             "--batch-size",
-            "16",
+            str(GRID_BATCH_SIZE),
             "--device",
             "cpu",
         ]
