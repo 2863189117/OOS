@@ -44,6 +44,11 @@ class LXeDiffusionConfig:
     n_gxe: float = 1.000702
     side_reflectivity: float = 0.95
     bottom_reflectivity: float = 0.0
+    # The production default derives the top Robin length from the P1 Fresnel
+    # moments. A named override is reserved for controlled tail-only A/B
+    # studies, such as a separately converged Fresnel--Milne solve.
+    top_boundary_model: str = "p1_moments"
+    top_boundary_length_mm: float | None = None
     radial_cells: int = 120
     depth_cells: int = 200
     incident_mu_order: int = 64
@@ -65,6 +70,22 @@ class LXeDiffusionConfig:
             value = getattr(self, name)
             if not (0.0 <= value <= 1.0):
                 raise ValueError(f"{name} must lie in [0, 1]")
+        if self.top_boundary_model == "p1_moments":
+            if self.top_boundary_length_mm is not None:
+                raise ValueError(
+                    "top_boundary_length_mm requires a non-default "
+                    "top_boundary_model"
+                )
+        elif (
+            not self.top_boundary_model
+            or self.top_boundary_length_mm is None
+            or not math.isfinite(self.top_boundary_length_mm)
+            or self.top_boundary_length_mm <= 0.0
+        ):
+            raise ValueError(
+                "a non-default top boundary model requires a finite positive "
+                "top_boundary_length_mm"
+            )
         if self.radial_cells < 2 or self.depth_cells < 2:
             raise ValueError("the diffusion grid must have at least two cells")
         if self.incident_mu_order < 2 or self.first_flight_order < 2:
@@ -182,6 +203,17 @@ def fresnel_extrapolation_length_mm(
         return math.inf
     boundary_factor = (1.0 + second_moment) / escape_current
     return 2.0 * diffusion_mm * boundary_factor
+
+
+def configured_top_extrapolation_length_mm(config: LXeDiffusionConfig) -> float:
+    """Return the explicitly selected top-boundary extrapolation length."""
+
+    config.validate()
+    if config.top_boundary_length_mm is not None:
+        return config.top_boundary_length_mm
+    return fresnel_extrapolation_length_mm(
+        config.transport_diffusion_mm, config.n_lxe, config.n_gxe
+    )
 
 
 def extrapolation_length_mm(diffusion_mm: float, reflectivity: float) -> float:
@@ -335,9 +367,7 @@ def build_diffusion_operator(
     )
     escape_fraction = 1.0 - first_moment
     top_reflectivity = first_moment
-    top_extrapolation = fresnel_extrapolation_length_mm(
-        diffusion, config.n_lxe, config.n_gxe
-    )
+    top_extrapolation = configured_top_extrapolation_length_mm(config)
     top_sink = np.zeros(count, dtype=float)
     for ir in range(nr):
         index = linear(0, ir)

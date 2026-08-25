@@ -16,7 +16,6 @@ import json
 import math
 from pathlib import Path
 import sys
-from typing import Iterable
 
 import h5py
 import numpy as np
@@ -30,6 +29,7 @@ if __package__ in (None, ""):
     )
     from generator.reference.lxe_diffusion_return import (
         LXeDiffusionConfig,
+        configured_top_extrapolation_length_mm,
         diffuse_fresnel_reflection_moments,
     )
     from generator.reference.lxe_response_operator import (
@@ -45,6 +45,7 @@ else:
     )
     from .reference.lxe_diffusion_return import (
         LXeDiffusionConfig,
+        configured_top_extrapolation_length_mm,
         diffuse_fresnel_reflection_moments,
     )
     from .reference.lxe_response_operator import build_lxe_response_operator
@@ -64,7 +65,19 @@ def sha256(path: Path) -> str:
 def source_digest() -> str:
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent
-    for path in sorted((root / "reference").glob("*.py")) + [
+    # Bind only code that can affect this generator.  Research helpers living
+    # beside these modules must not invalidate an otherwise reusable LXe block.
+    reference_dependencies = (
+        "lxe_cylinder_green.py",
+        "lxe_cuda.py",
+        "lxe_diffusion_return.py",
+        "lxe_p1_vector_tail.py",
+        "lxe_response_operator.py",
+        "lxe_scalar_collision.py",
+        "numerics.py",
+        "phase_space_grid.py",
+    )
+    for path in [root / "reference" / name for name in reference_dependencies] + [
         Path(__file__).resolve(),
         root / "write_intrinsic_lxe_block.py",
     ]:
@@ -89,9 +102,7 @@ def geometry_lxe_contract(
     """Return the liquid-only geometry identity used by the LXe block."""
 
     with h5py.File(path, "r") as handle:
-        generator = json.loads(
-            bytes(handle["/metadata/generator_json"][:]).decode()
-        )
+        generator = json.loads(bytes(handle["/metadata/generator_json"][:]).decode())
         config = generator["config"]
         radius_mm = float(config["active_radius_mm"])
         depth_mm = float(config["lxe_depth_mm"])
@@ -176,6 +187,7 @@ def geometry_lxe_contract(
                 "bounds",
                 "center_mm",
                 "normal",
+                "area_mm2",
                 "surface_element",
             ):
                 _update_array_digest(
@@ -185,27 +197,19 @@ def geometry_lxe_contract(
                 )
             representation = "analytic"
         else:
-            surface = np.asarray(
-                handle["/geometry/surface_id"], dtype=np.uint32
-            )
-            minus = np.asarray(
-                handle["/geometry/minus_domain_id"], dtype=np.int32
-            )
-            plus = np.asarray(
-                handle["/geometry/plus_domain_id"], dtype=np.int32
-            )
+            surface = np.asarray(handle["/geometry/surface_id"], dtype=np.uint32)
+            minus = np.asarray(handle["/geometry/minus_domain_id"], dtype=np.int32)
+            plus = np.asarray(handle["/geometry/plus_domain_id"], dtype=np.int32)
             selected = np.flatnonzero(
                 (surface == surface_id)
                 & ((minus == gxe_domain_id) ^ (plus == gxe_domain_id))
             )
             if selected.size == 0:
                 raise RuntimeError("triangle geometry has no LXe surface")
-            triangles = np.asarray(
-                handle["/geometry/triangles"], dtype=np.uint32
-            )[selected]
-            vertices = np.asarray(
-                handle["/geometry/vertices"], dtype=np.float64
-            )
+            triangles = np.asarray(handle["/geometry/triangles"], dtype=np.uint32)[
+                selected
+            ]
+            vertices = np.asarray(handle["/geometry/vertices"], dtype=np.float64)
             _update_array_digest(digest, "triangle/index", selected)
             _update_array_digest(digest, "triangle/vertices", vertices[triangles])
             _update_array_digest(digest, "triangle/minus", minus[selected])
@@ -255,10 +259,7 @@ def refract_direction(
     discriminant = 1.0 - ratio * ratio * (1.0 - cosine * cosine)
     if discriminant < 0.0:
         return None
-    result = (
-        ratio * direction
-        + (ratio * cosine - math.sqrt(discriminant)) * normal
-    )
+    result = ratio * direction + (ratio * cosine - math.sqrt(discriminant)) * normal
     return result / np.linalg.norm(result)
 
 
@@ -272,28 +273,21 @@ def diffuse_escape_quadrature(
 
     ratio = config.n_gxe / config.n_lxe
     critical_mu = math.sqrt(max(0.0, 1.0 - ratio * ratio))
-    first, second = diffuse_fresnel_reflection_moments(
-        config.n_lxe, config.n_gxe
+    # Keep the escaping P1 angular closure consistent with the same Robin
+    # length used by the finite-cylinder solve.  This is algebraically equal
+    # to (1+C2)/(1-C1) for the default moment closure and follows an explicit
+    # Fresnel--Milne override for the isolated candidate.
+    boundary_factor = configured_top_extrapolation_length_mm(config) / (
+        2.0 * config.transport_diffusion_mm
     )
-    boundary_factor = (1.0 + second) / (1.0 - first)
-    mu_nodes, mu_weights = gauss_interval(
-        liquid_mu_order, critical_mu, 1.0
-    )
+    mu_nodes, mu_weights = gauss_interval(liquid_mu_order, critical_mu, 1.0)
     directions: list[np.ndarray] = []
     polarization: list[np.ndarray] = []
     for mu, mu_weight in zip(mu_nodes, mu_weights):
-        _, transmission, _ = fresnel_power(
-            config.n_lxe, config.n_gxe, float(mu)
-        )
+        _, transmission, _ = fresnel_power(config.n_lxe, config.n_gxe, float(mu))
         transverse = math.sqrt(max(0.0, 1.0 - float(mu) ** 2))
         radiance = 2.0 * boundary_factor + 3.0 * float(mu)
-        base = (
-            2.0
-            * float(mu)
-            * radiance
-            * float(mu_weight)
-            / direction_phi
-        )
+        base = 2.0 * float(mu) * radiance * float(mu_weight) / direction_phi
         for index in range(direction_phi):
             phi = 2.0 * math.pi * (index + 0.5) / direction_phi
             liquid = np.asarray(
@@ -330,9 +324,7 @@ def diffuse_escape_quadrature(
     return np.asarray(directions), weights, stokes
 
 
-def barycentric(
-    point: np.ndarray, triangle: np.ndarray
-) -> tuple[np.ndarray, float]:
+def barycentric(point: np.ndarray, triangle: np.ndarray) -> tuple[np.ndarray, float]:
     a, b, c = triangle
     edge0 = b - a
     edge1 = c - a
@@ -379,17 +371,12 @@ def locate_surface_points(
             primitive_plus = np.asarray(
                 handle["/analytic/plus_domain_id"], dtype=np.int32
             )
-            primitive_axis_x = np.asarray(
-                handle["/analytic/axis_x"], dtype=float
-            )
+            primitive_axis_x = np.asarray(handle["/analytic/axis_x"], dtype=float)
             element_primitive = np.asarray(
                 handle["/analytic/elements/primitive_index"],
                 dtype=np.uint32,
             )
-            selected = (
-                primitive_surface[element_primitive]
-                == np.uint32(surface_id)
-            )
+            selected = primitive_surface[element_primitive] == np.uint32(surface_id)
             if np.any(selected):
                 centers = np.asarray(
                     handle["/analytic/elements/center_mm"], dtype=float
@@ -398,9 +385,9 @@ def locate_surface_points(
                     handle["/analytic/elements/surface_element"],
                     dtype=np.uint64,
                 )[selected]
-                normals = np.asarray(
-                    handle["/analytic/elements/normal"], dtype=float
-                )[selected]
+                normals = np.asarray(handle["/analytic/elements/normal"], dtype=float)[
+                    selected
+                ]
                 owners = element_primitive[selected]
                 tree = cKDTree(centers)
                 distance, nearest = tree.query(points, k=1)
@@ -423,9 +410,7 @@ def locate_surface_points(
                     )
                 return (
                     elements[nearest],
-                    np.tile(
-                        np.asarray([1.0, 0.0, 0.0]), (len(points), 1)
-                    ),
+                    np.tile(np.asarray([1.0, 0.0, 0.0]), (len(points), 1)),
                     side,
                     primitive_axis_x[owners],
                     side_normal,
@@ -455,9 +440,7 @@ def locate_surface_points(
         selected = None
         best_score = math.inf
         for candidate in np.atleast_1d(nearby[index]):
-            values, distance = barycentric(
-                point, surface_triangles[int(candidate)]
-            )
+            values, distance = barycentric(point, surface_triangles[int(candidate)])
             negativity = max(0.0, -float(values.min()))
             score = distance + 1000.0 * negativity
             if score < best_score:
@@ -476,9 +459,7 @@ def locate_surface_points(
         values /= values.sum()
         primitive = int(primitives[ordinal])
         triangle = surface_triangles[ordinal]
-        geometric = np.cross(
-            triangle[1] - triangle[0], triangle[2] - triangle[0]
-        )
+        geometric = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
         geometric /= np.linalg.norm(geometric)
         if int(plus[primitive]) == gxe_domain_id:
             output_side = 1
@@ -487,9 +468,7 @@ def locate_surface_points(
             output_side = 0
             normal = -geometric
         else:
-            raise RuntimeError(
-                "LXe surface triangle is not adjacent to the GXe domain"
-            )
+            raise RuntimeError("LXe surface triangle is not adjacent to the GXe domain")
         edge = triangle[1] - triangle[0]
         edge /= np.linalg.norm(edge)
         element[index] = ordinal
@@ -510,6 +489,7 @@ def egress_basis(
     surface_id: int,
     gxe_domain_id: int,
     tolerance_mm: float,
+    rotate_with_surface_phi: bool = False,
 ) -> tuple[np.ndarray, ...]:
     surface_phi = (
         2.0
@@ -541,13 +521,25 @@ def egress_basis(
     result_stokes = np.tile(angular_stokes, (len(points), 1))
     for point_index in range(len(points)):
         bitangent = np.cross(normal[point_index], tangent[point_index])
-        basis = np.column_stack(
-            [tangent[point_index], bitangent, normal[point_index]]
-        )
+        basis = np.column_stack([tangent[point_index], bitangent, normal[point_index]])
         for angle_index, direction in enumerate(gas_direction):
             output = point_index * angular_count + angle_index
-            result_direction[output] = basis.T @ direction
-            azimuth = math.atan2(float(direction[1]), float(direction[0]))
+            world_direction = direction
+            if rotate_with_surface_phi:
+                phi = float(surface_phi[point_index % surface_phi_bins])
+                cosine = math.cos(phi)
+                sine = math.sin(phi)
+                world_direction = np.asarray(
+                    [
+                        cosine * direction[0] - sine * direction[1],
+                        sine * direction[0] + cosine * direction[1],
+                        direction[2],
+                    ]
+                )
+            result_direction[output] = basis.T @ world_direction
+            azimuth = math.atan2(
+                float(world_direction[1]), float(world_direction[0])
+            )
             s_axis = np.asarray([-math.sin(azimuth), math.cos(azimuth), 0.0])
             if np.linalg.norm(s_axis) < 1.0e-14:
                 s_axis = tangent[point_index]
@@ -567,14 +559,13 @@ def cache_key(
 ) -> str:
     material = {
         "schema": "oos.dual-phase-tpc.lxe-function-generator.v2",
-        "geometry_contract_sha256": geometry_contract[
-            "fingerprint_sha256"
-        ],
+        "geometry_contract_sha256": geometry_contract["fingerprint_sha256"],
         "generator_sha256": source_digest(),
         "parameters": {
             key: value
             for key, value in vars(arguments).items()
-            if key not in {
+            if key
+            not in {
                 "output",
                 "force",
                 "geometry",
@@ -591,9 +582,7 @@ def cache_key(
 def stored_cache_key(path: Path) -> str | None:
     try:
         with h5py.File(path, "r") as handle:
-            raw = bytes(
-                np.asarray(handle["/metadata/generator_json"], dtype=np.uint8)
-            )
+            raw = bytes(np.asarray(handle["/metadata/generator_json"], dtype=np.uint8))
         return json.loads(raw.decode()).get("cache_key_sha256")
     except (OSError, KeyError, ValueError, json.JSONDecodeError):
         return None
@@ -615,16 +604,71 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--surface-phi-bins", type=int, default=80)
     result.add_argument("--return-mu-order", type=int, default=4)
     result.add_argument("--return-direction-phi", type=int, default=8)
+    result.add_argument(
+        "--egress-angular-layout",
+        choices=("surface_marginal", "joint_surface_angle"),
+        default="surface_marginal",
+        help=(
+            "production surface-position marginal or the experimental joint "
+            "surface-position/egress-angle response"
+        ),
+    )
+    result.add_argument(
+        "--diffuse-tail-angular-model",
+        choices=("scalar_p1", "full_vector_p1_raw"),
+        default="scalar_p1",
+        help=(
+            "isolated collision-tail angular closure; full_vector_p1_raw "
+            "writes raw normal/radial/azimuthal P1 channels and audits the "
+            "tangent-only limiter without applying it"
+        ),
+    )
+    result.add_argument(
+        "--p1-vector-audit-phi-bins",
+        type=int,
+        default=132,
+        help="dense surface-azimuth bins used only for full-vector P1 audits",
+    )
     result.add_argument("--first-scatter-order", type=int, default=8)
     result.add_argument("--explicit-collision-order", type=int, default=7)
-    result.add_argument("--collision-sample-power", type=int, default=12)
+    result.add_argument(
+        "--collision-sample-power",
+        type=int,
+        default=11,
+        help=(
+            "Sobol collision samples as a power of two; the practical "
+            "production default is 11 (2048 samples), while 12 is the "
+            "higher-precision comparison profile"
+        ),
+    )
     result.add_argument("--collision-maximum-events", type=int, default=64)
     result.add_argument("--processes", type=int, default=24)
-    result.add_argument("--rayleigh-length-mm", type=float,
-                        default=341.51442280354416)
+    result.add_argument(
+        "--compute-backend",
+        choices=("cpu", "cuda", "auto"),
+        default="auto",
+        help=(
+            "backend for explicit LXe collisions and modal projection; the "
+            "default auto mode uses CUDA when a usable CuPy runtime is present"
+        ),
+    )
+    result.add_argument("--rayleigh-length-mm", type=float, default=341.51442280354416)
     result.add_argument("--absorption-length-mm", type=float, default=70000.0)
     result.add_argument("--side-reflectivity", type=float, default=0.95)
     result.add_argument("--bottom-reflectivity", type=float, default=0.0)
+    result.add_argument(
+        "--top-boundary-model",
+        default="p1_moments",
+        help=(
+            "provenance label for the top Robin boundary; a non-default "
+            "model requires --top-boundary-length-mm"
+        ),
+    )
+    result.add_argument(
+        "--top-boundary-length-mm",
+        type=float,
+        help="verified top extrapolation length for a controlled tail-only A/B",
+    )
     result.add_argument("--n-lxe", type=float, default=1.6829)
     result.add_argument("--n-gxe", type=float, default=1.000702)
     result.add_argument("--azimuthal-maximum", type=int, default=32)
@@ -675,12 +719,20 @@ def main() -> None:
         n_gxe=arguments.n_gxe,
         side_reflectivity=arguments.side_reflectivity,
         bottom_reflectivity=arguments.bottom_reflectivity,
+        top_boundary_model=arguments.top_boundary_model,
+        top_boundary_length_mm=arguments.top_boundary_length_mm,
     )
     truncation = ModeTruncation(
         azimuthal_maximum=arguments.azimuthal_maximum,
         radial_modes=arguments.radial_modes,
         samples_per_expected_root=arguments.root_samples,
     )
+    gas_direction, angular_weight, angular_stokes = diffuse_escape_quadrature(
+        lxe,
+        liquid_mu_order=arguments.return_mu_order,
+        direction_phi=arguments.return_direction_phi,
+    )
+    joint_angular = arguments.egress_angular_layout == "joint_surface_angle"
     operator = build_lxe_response_operator(
         LXeCylinderGreen(lxe, truncation, mode_workers=1),
         grid,
@@ -691,13 +743,14 @@ def main() -> None:
         collision_maximum_events=arguments.collision_maximum_events,
         processes=arguments.processes,
         coefficient_dtype="complex128",
-    )
-    gas_direction, angular_weight, angular_stokes = (
-        diffuse_escape_quadrature(
-            lxe,
-            liquid_mu_order=arguments.return_mu_order,
-            direction_phi=arguments.return_direction_phi,
-        )
+        compute_backend=arguments.compute_backend,
+        angular_direction=gas_direction if joint_angular else None,
+        angular_weight=angular_weight if joint_angular else None,
+        angular_direction_phi_bins=(
+            arguments.return_direction_phi if joint_angular else 0
+        ),
+        diffuse_tail_angular_model=arguments.diffuse_tail_angular_model,
+        p1_vector_audit_phi_bins=arguments.p1_vector_audit_phi_bins,
     )
     egress = egress_basis(
         arguments.geometry,
@@ -708,6 +761,7 @@ def main() -> None:
         surface_id=arguments.surface_id,
         gxe_domain_id=arguments.gxe_domain_id,
         tolerance_mm=arguments.geometry_tolerance_mm,
+        rotate_with_surface_phi=joint_angular,
     )
     temporary = arguments.output.with_suffix(arguments.output.suffix + ".tmp")
     write_factorized_block(
@@ -730,9 +784,7 @@ def main() -> None:
             **operator.metadata,
             "cache_key_sha256": key,
             "geometry_sha256": sha256(arguments.geometry),
-            "geometry_contract_sha256": geometry_contract[
-                "fingerprint_sha256"
-            ],
+            "geometry_contract_sha256": geometry_contract["fingerprint_sha256"],
             "geometry_contract": geometry_contract,
             "generator_sha256": source_digest(),
             "surface_phi_bins": arguments.surface_phi_bins,

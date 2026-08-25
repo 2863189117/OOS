@@ -120,6 +120,10 @@ def verify_lxe_block_geometry(geometry: Path, block: Path) -> dict:
     return {
         "radius_mm": radius_mm,
         "depth_mm": depth_mm,
+        "coefficient_layout": generator.get("coefficient_layout"),
+        "generator_sha256": generator.get("generator_sha256"),
+        "compute_backend": generator.get("compute_backend"),
+        "collision_sample_power": generator.get("collision_sample_power"),
         "geometry_contract_sha256": generator.get(
             "geometry_contract_sha256"
         ),
@@ -342,6 +346,25 @@ def main() -> None:
             ]
         )
     stages.append(run(build, arguments.output / "build.log"))
+    if not arguments.direct_solve and (
+        arguments.force_rebuild or not effective.is_file()
+    ):
+        stages.append(
+            run(
+                [
+                    str(arguments.oos_efficiency),
+                    "precompute",
+                    str(operators),
+                    "--output",
+                    str(effective),
+                    "--cycles",
+                    "7",
+                    "--device",
+                    arguments.device,
+                ],
+                arguments.output / "precompute.log",
+            )
+        )
     solve = [
         str(arguments.oos_efficiency),
         "calculate",

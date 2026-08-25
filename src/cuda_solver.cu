@@ -600,14 +600,13 @@ EffectiveResponse build_effective_response_cuda(
     const OperatorSet& operators, std::uint32_t cycles,
     std::uint64_t batch_size) {
   operators.validate();
-  if (cycles == 0 || batch_size == 0)
-    throw std::runtime_error(
-        "effective response cycles and batch size must be positive");
+  if (batch_size == 0)
+    throw std::runtime_error("effective response batch size must be positive");
+  const bool automatic_cycles = cycles == 0;
   EffectiveResponse response;
   response.states = operators.transition.rows;
   response.channels = operators.detection.cols;
   response.losses = operators.losses.cols;
-  response.cycles = cycles;
   response.build_batch_size = batch_size;
   response.operator_tolerance = operators.tolerance;
   response.construction_method = "adjoint_linear";
@@ -719,6 +718,43 @@ EffectiveResponse build_effective_response_cuda(
                                             0.0);
     std::vector<double> host_loss_seed(batch_size * response.losses, 0.0);
     std::vector<double> host_state(batch_size * response.states, 0.0);
+    std::vector<double> automatic_unresolved;
+    if (automatic_cycles) {
+      if (operators.maximum_iterations == 0)
+        throw std::runtime_error(
+            "automatic adjoint iteration limit must be positive");
+      std::fill_n(host_state.begin(), response.states, 1.0);
+      check_cuda(cudaMemcpy(next_state.data(), host_state.data(),
+                            response.states * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "copy automatic adjoint unresolved terminal");
+      check_cuda(cudaMemset(detection_seed.data(), 0,
+                            response.channels * sizeof(double)),
+                 "clear automatic adjoint detection seeds");
+      check_cuda(cudaMemset(loss_seed.data(), 0,
+                            response.losses * sizeof(double)),
+                 "clear automatic adjoint loss seeds");
+      bool converged = false;
+      for (cycles = 1; cycles <= operators.maximum_iterations; ++cycles) {
+        apply_cycle(1);
+        check_cuda(cudaMemcpy(host_state.data(), next_state.data(),
+                              response.states * sizeof(double),
+                              cudaMemcpyDeviceToHost),
+                   "copy automatic adjoint unresolved response");
+        const double maximum = *std::max_element(
+            host_state.begin(), host_state.begin() + response.states);
+        if (maximum <= operators.tolerance) {
+          automatic_unresolved.assign(
+              host_state.begin(), host_state.begin() + response.states);
+          converged = true;
+          break;
+        }
+      }
+      if (!converged)
+        throw std::runtime_error(
+            "automatic adjoint effective response did not converge");
+    }
+    response.cycles = cycles;
     const auto build_terminal =
         [&](std::uint64_t terminal_count, bool is_detection,
             std::vector<double>& output) {
@@ -761,23 +797,27 @@ EffectiveResponse build_effective_response_cuda(
     build_terminal(response.channels, true, response.state_to_detection);
     build_terminal(response.losses, false, response.state_to_losses);
 
-    std::fill(host_state.begin(), host_state.end(), 0.0);
-    std::fill_n(host_state.begin(), response.states, 1.0);
-    check_cuda(cudaMemcpy(next_state.data(), host_state.data(),
-                          response.states * sizeof(double),
-                          cudaMemcpyHostToDevice),
-               "copy adjoint unresolved terminal");
-    check_cuda(cudaMemset(detection_seed.data(), 0,
-                          response.channels * sizeof(double)),
-               "clear adjoint unresolved detection seeds");
-    check_cuda(cudaMemset(loss_seed.data(), 0,
-                          response.losses * sizeof(double)),
-               "clear adjoint unresolved loss seeds");
-    for (std::uint32_t cycle = 0; cycle < cycles; ++cycle) apply_cycle(1);
-    check_cuda(cudaMemcpy(response.state_unresolved.data(), next_state.data(),
-                          response.states * sizeof(double),
-                          cudaMemcpyDeviceToHost),
-               "copy adjoint unresolved response");
+    if (automatic_cycles) {
+      response.state_unresolved = std::move(automatic_unresolved);
+    } else {
+      std::fill(host_state.begin(), host_state.end(), 0.0);
+      std::fill_n(host_state.begin(), response.states, 1.0);
+      check_cuda(cudaMemcpy(next_state.data(), host_state.data(),
+                            response.states * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "copy adjoint unresolved terminal");
+      check_cuda(cudaMemset(detection_seed.data(), 0,
+                            response.channels * sizeof(double)),
+                 "clear adjoint unresolved detection seeds");
+      check_cuda(cudaMemset(loss_seed.data(), 0,
+                            response.losses * sizeof(double)),
+                 "clear adjoint unresolved loss seeds");
+      for (std::uint32_t cycle = 0; cycle < cycles; ++cycle) apply_cycle(1);
+      check_cuda(cudaMemcpy(response.state_unresolved.data(), next_state.data(),
+                            response.states * sizeof(double),
+                            cudaMemcpyDeviceToHost),
+                 "copy adjoint unresolved response");
+    }
     cublasDestroy(blas);
     cusparseDestroy(sparse);
   } catch (...) {
