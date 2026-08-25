@@ -40,8 +40,11 @@ std::string effective_response_fingerprint(
 // Builds the bounded response by propagating terminal bases through the
 // adjoint transport operator. There is intentionally no forward-basis
 // precompute implementation.
+// A cycle count of zero selects automatic convergence: the smallest cycle
+// count whose all-state unresolved remainder is at most the operator
+// tolerance, bounded by OperatorSet::maximum_iterations.
 EffectiveResponse build_effective_response_cpu(const OperatorSet& operators,
-                                                std::uint32_t cycles = 7,
+                                                std::uint32_t cycles = 0,
                                                 std::uint64_t batch_size = 32);
 
 SolveResult apply_effective_response_cpu(const EffectiveResponse& response,

@@ -73,10 +73,17 @@ class ScalarExitEvents:
 
 @dataclass(frozen=True)
 class ScalarCollisionSnapshot:
-    """Path-space state immediately after one requested collision order."""
+    """Path-space state immediately after one requested collision order.
+
+    ``source_direction`` is the sampled outgoing direction after the Rayleigh
+    collision at ``source_xyz_mm``.  The legacy P1 tail intentionally ignores
+    it, while SP_N or angle-resolved tails need it to compare alternative
+    closures from an identical hand-off state.
+    """
 
     collision_order: int
     source_xyz_mm: np.ndarray
+    source_direction: np.ndarray
     source_weight: np.ndarray
     explicit_exits: ScalarExitEvents
     audit: dict[str, float]
@@ -296,6 +303,9 @@ def propagate_scalar_collision_orders(
     snapshot_positions: dict[int, list[np.ndarray]] = {
         order: [] for order in orders
     }
+    snapshot_directions: dict[int, list[np.ndarray]] = {
+        order: [] for order in orders
+    }
     snapshot_weights: dict[int, list[np.ndarray]] = {
         order: [] for order in orders
     }
@@ -346,6 +356,7 @@ def propagate_scalar_collision_orders(
                 selected = scatter_indices[collision_count[scatter_indices] == order]
                 if len(selected):
                     snapshot_positions[order].append(position[selected].copy())
+                    snapshot_directions[order].append(direction[selected].copy())
                     snapshot_weights[order].append(weight[selected].copy())
                     if order == maximum_order:
                         active[selected] = False
@@ -501,9 +512,11 @@ def propagate_scalar_collision_orders(
     for order in orders:
         if not snapshot_positions[order]:
             source_position = np.empty((0, 3), dtype=float)
+            source_direction = np.empty((0, 3), dtype=float)
             source_weight = np.empty(0, dtype=float)
         else:
             source_position = np.concatenate(snapshot_positions[order])
+            source_direction = np.concatenate(snapshot_directions[order])
             source_weight = np.concatenate(snapshot_weights[order])
         exit_mask = all_exit_collisions < order
         loss_mask = all_loss_collisions < order
@@ -527,6 +540,7 @@ def propagate_scalar_collision_orders(
         result[order] = ScalarCollisionSnapshot(
             collision_order=order,
             source_xyz_mm=source_position,
+            source_direction=source_direction,
             source_weight=source_weight,
             explicit_exits=explicit,
             audit={

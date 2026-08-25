@@ -78,6 +78,10 @@ class AnalyticDiscretization:
     hole_wall_z: int = 1
     outer_wall_phi: int = 96
     outer_wall_max_z_mm: float = 20.0
+    lxe_surface_phi_bins: int = 80
+    lxe_surface_target_arc_mm: float | None = None
+    lxe_surface_min_phi: int = 65
+    lxe_surface_phi_multiple: int = 6
 
     @classmethod
     def profile(cls, name: str) -> "AnalyticDiscretization":
@@ -193,7 +197,7 @@ def _area_quadrature_elements(
     outer_radius_mm: float,
     normal_z: float,
     radial_order: int = 4,
-    phi_count: int = 16,
+    phi_count: int | tuple[int, ...] | list[int] | np.ndarray = 16,
     surface_element_offset: int = 0,
     projected_aperture_primitive_index: int = np.iinfo(np.uint32).max,
     projected_aperture_hole_index: int = np.iinfo(np.uint32).max,
@@ -206,17 +210,26 @@ def _area_quadrature_elements(
     u_edges[-1] = 1.0
     inner2 = inner_radius_mm**2
     span2 = outer_radius_mm**2 - inner2
+    if np.isscalar(phi_count):
+        phi_count_by_ring = np.full(radial_order, int(phi_count), dtype=int)
+    else:
+        phi_count_by_ring = np.asarray(phi_count, dtype=int)
+        if phi_count_by_ring.shape != (radial_order,):
+            raise ValueError("phi_count must be scalar or one value per ring")
+    if np.any(phi_count_by_ring <= 0):
+        raise ValueError("phi_count values must be positive")
     result: list[AnalyticElement] = []
+    surface_element = int(surface_element_offset)
     for radial_index, (node, weight) in enumerate(zip(nodes, weights)):
+        ring_phi_count = int(phi_count_by_ring[radial_index])
         radius2 = inner2 + span2 * float(node)
         radius = math.sqrt(max(0.0, radius2))
         lower2 = inner2 + span2 * float(u_edges[radial_index])
         upper2 = inner2 + span2 * float(u_edges[radial_index + 1])
-        for phi_index in range(phi_count):
-            phi_lower = 2.0 * math.pi * phi_index / phi_count
-            phi_upper = 2.0 * math.pi * (phi_index + 1) / phi_count
+        for phi_index in range(ring_phi_count):
+            phi_lower = 2.0 * math.pi * phi_index / ring_phi_count
+            phi_upper = 2.0 * math.pi * (phi_index + 1) / ring_phi_count
             phi = 0.5 * (phi_lower + phi_upper)
-            local = radial_index * phi_count + phi_index
             result.append(
                 AnalyticElement(
                     primitive_index,
@@ -231,9 +244,9 @@ def _area_quadrature_elements(
                     math.pi
                     * span2
                     * float(weight)
-                    / phi_count,
+                    / ring_phi_count,
                     0,
-                    surface_element_offset + local,
+                    surface_element,
                     projected_aperture_primitive_index,
                     projected_aperture_hole_index,
                     source_quadrature,
@@ -245,7 +258,43 @@ def _area_quadrature_elements(
                     ),
                 )
             )
+            surface_element += 1
     return result
+
+
+def _ragged_ring_phi_counts(
+    radius_mm: np.ndarray,
+    *,
+    target_arc_mm: float,
+    min_phi: int,
+    phi_multiple: int = 6,
+) -> np.ndarray:
+    """Return per-ring azimuthal counts for an approximately fixed arc.
+
+    ``min_phi`` is intentionally explicit: callers must choose it no smaller
+    than ``2 * M + 1`` for the highest retained Fourier order ``M``.  Rounding
+    to a common multiple preserves detector rotational subgroups while the
+    radial variation avoids severe over-resolution of the inner rings.
+    """
+
+    radius = np.asarray(radius_mm, dtype=float)
+    if radius.ndim != 1 or radius.size == 0 or np.any(~np.isfinite(radius)):
+        raise ValueError("radius_mm must be a finite non-empty vector")
+    if np.any(radius < 0.0):
+        raise ValueError("radius_mm must be nonnegative")
+    if not math.isfinite(target_arc_mm) or target_arc_mm <= 0.0:
+        raise ValueError("target_arc_mm must be finite and positive")
+    if min_phi <= 0:
+        raise ValueError("min_phi must be positive")
+    if phi_multiple <= 0:
+        raise ValueError("phi_multiple must be positive")
+    requested = np.maximum(
+        min_phi,
+        np.ceil(2.0 * math.pi * radius / target_arc_mm).astype(np.int64),
+    )
+    return (
+        ((requested + phi_multiple - 1) // phi_multiple) * phi_multiple
+    ).astype(np.int64)
 
 
 def build_analytic_transport(
@@ -254,6 +303,12 @@ def build_analytic_transport(
     pmt_xy: np.ndarray,
     channel_id: np.ndarray,
 ) -> tuple[list[Primitive], list[AnalyticElement]]:
+    if discretization.lxe_surface_phi_bins <= 0:
+        raise ValueError("lxe_surface_phi_bins must be positive")
+    if discretization.lxe_surface_min_phi <= 0:
+        raise ValueError("lxe_surface_min_phi must be positive")
+    if discretization.lxe_surface_phi_multiple <= 0:
+        raise ValueError("lxe_surface_phi_multiple must be positive")
     primitives: list[Primitive] = []
     elements: list[AnalyticElement] = []
     pmt_tree = cKDTree(pmt_xy)
@@ -648,11 +703,27 @@ def build_analytic_transport(
                     )
                 )
                 patch += 1
-    # The nonlocal LXe block emits on the same intrinsic area-uniform
-    # 40-by-80 surface basis used by its Fourier--Bessel return operator.
+    # The nonlocal LXe block emits on the same intrinsic area-uniform surface
+    # basis used by its Fourier--Bessel return operator.  The radial order is
+    # fixed here while the azimuthal resolution is an identity-bearing
+    # analytic-discretization control.
     # These elements are local to the GXe--LXe surface; they do not refer to
     # the validation triangles and therefore remain stable if that mesh is
     # retriangulated.
+    lxe_phi_count: int | np.ndarray = discretization.lxe_surface_phi_bins
+    if discretization.lxe_surface_target_arc_mm is not None:
+        _, radial_weights = np.polynomial.legendre.leggauss(40)
+        radial_outer_u = np.cumsum(0.5 * radial_weights)
+        radial_outer_u[-1] = 1.0
+        radial_outer_radius = config.active_radius_mm * np.sqrt(
+            radial_outer_u
+        )
+        lxe_phi_count = _ragged_ring_phi_counts(
+            radial_outer_radius,
+            target_arc_mm=discretization.lxe_surface_target_arc_mm,
+            min_phi=discretization.lxe_surface_min_phi,
+            phi_multiple=discretization.lxe_surface_phi_multiple,
+        )
     elements.extend(
         _area_quadrature_elements(
             lxe_primitive,
@@ -662,7 +733,7 @@ def build_analytic_transport(
             outer_radius_mm=config.active_radius_mm,
             normal_z=-1.0,
             radial_order=40,
-            phi_count=80,
+            phi_count=lxe_phi_count,
             source_quadrature=False,
         )
     )
@@ -947,8 +1018,8 @@ def build(
             handle["/geometry/triangle_transport"][...] = np.where(
                 replaced, 0, 1
             ).astype(np.uint8)
-            # The exact analytic LXe disk owns ray intersection and its
-            # 40x80 intrinsic elements own only the return basis.  The
+            # The exact analytic LXe disk owns ray intersection.  Its
+            # intrinsic LXe elements own only the return basis.  The
             # canonical triangulation independently partitions the disk for
             # exact-solid-angle adaptive source integration.
             handle["/geometry/triangle_source_quadrature"][...] = np.where(
@@ -1018,6 +1089,35 @@ def main() -> None:
     parser.add_argument("--hole-wall-z", type=int)
     parser.add_argument("--outer-wall-phi", type=int)
     parser.add_argument("--outer-wall-max-z-mm", type=float)
+    parser.add_argument(
+        "--lxe-surface-phi-bins",
+        type=int,
+        help=(
+            "azimuthal bins in the intrinsic LXe return surface basis "
+            "(default: 80)"
+        ),
+    )
+    parser.add_argument(
+        "--lxe-surface-target-arc-mm",
+        type=float,
+        help=(
+            "enable a ragged-ring LXe quadrature with approximately this "
+            "azimuthal arc length; omitted preserves the uniform 80-bin basis"
+        ),
+    )
+    parser.add_argument(
+        "--lxe-surface-min-phi",
+        type=int,
+        help=(
+            "minimum azimuthal count per ragged ring; choose at least "
+            "2*M+1 for retained Fourier order M (default: 65)"
+        ),
+    )
+    parser.add_argument(
+        "--lxe-surface-phi-multiple",
+        type=int,
+        help="round each ragged-ring count up to this multiple (default: 6)",
+    )
     parser.add_argument("--force", action="store_true")
     arguments = parser.parse_args()
     config = replace(GeometryConfig(), height_mm=arguments.height_mm)
@@ -1032,6 +1132,10 @@ def main() -> None:
             "hole_wall_z",
             "outer_wall_phi",
             "outer_wall_max_z_mm",
+            "lxe_surface_phi_bins",
+            "lxe_surface_target_arc_mm",
+            "lxe_surface_min_phi",
+            "lxe_surface_phi_multiple",
         )
         if getattr(arguments, name) is not None
     }

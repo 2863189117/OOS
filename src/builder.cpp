@@ -78,6 +78,17 @@ std::vector<std::pair<double, double>> gauss_legendre_unit_interval(
   return result;
 }
 
+const std::vector<std::pair<double, double>>&
+cached_gauss_legendre_unit_interval(std::uint32_t count) {
+  thread_local std::map<
+      std::uint32_t, std::vector<std::pair<double, double>>>
+      cache;
+  auto found = cache.find(count);
+  if (found == cache.end())
+    found = cache.emplace(count, gauss_legendre_unit_interval(count)).first;
+  return found->second;
+}
+
 struct EmbeddedQuadratureNode {
   double unit_node{};
   double high_weight{};
@@ -528,6 +539,22 @@ struct SurfaceEmitter {
   std::int32_t plus_domain_id{-1};
   std::string label;
 };
+
+std::optional<double> complete_plane_rectangle_area(
+    const AnalyticSurfaceElement& element) {
+  if (element.coordinates != AnalyticSurfaceCoordinates::plane_uv)
+    return std::nullopt;
+  const double rectangle_area =
+      (element.bounds[1] - element.bounds[0]) *
+      (element.bounds[3] - element.bounds[2]);
+  const double area_tolerance =
+      256.0 * std::numeric_limits<double>::epsilon() *
+      std::max({1.0, rectangle_area, element.area_mm2});
+  if (!(rectangle_area > 0.0) ||
+      std::abs(element.area_mm2 - rectangle_area) > area_tolerance)
+    return std::nullopt;
+  return rectangle_area;
+}
 
 struct LocalSurfaceBasis {
   std::vector<std::vector<SurfaceEmitter>> state_emitters;
@@ -1291,6 +1318,32 @@ double exact_triangle_solid_angle(const Vec3& point,
   return 2.0 * std::atan2(numerator, denominator);
 }
 
+std::optional<double> exact_plane_rectangle_solid_angle(
+    const Vec3& point, const AnalyticPrimitive& primitive,
+    const AnalyticSurfaceElement& element) {
+  // Clipped disk and aperture-edge cells retain their sampled area and
+  // centroid rule.  Only a complete UV rectangle has an exact four-corner
+  // representation.
+  if (!complete_plane_rectangle_area(element))
+    return std::nullopt;
+
+  const auto corner = [&](double u, double v) {
+    return add(primitive.center_mm,
+               add(scale(primitive.axis_x, u),
+                   scale(primitive.axis_y, v)));
+  };
+  const Vec3 lower_left = corner(element.bounds[0], element.bounds[2]);
+  const Vec3 lower_right = corner(element.bounds[1], element.bounds[2]);
+  const Vec3 upper_right = corner(element.bounds[1], element.bounds[3]);
+  const Vec3 upper_left = corner(element.bounds[0], element.bounds[3]);
+  const ShapeFactorTriangle first{
+      lower_left, lower_right, upper_right, element.primitive_index, 0, {}};
+  const ShapeFactorTriangle second{
+      lower_left, upper_right, upper_left, element.primitive_index, 0, {}};
+  return exact_triangle_solid_angle(point, first) +
+         exact_triangle_solid_angle(point, second);
+}
+
 double estimated_triangle_solid_angle(
     const Vec3& displacement, double distance,
     const ShapeFactorTriangle& triangle) {
@@ -1596,7 +1649,7 @@ double projected_aperture_coverage(
       aperture_coordinates(receiver.center_mm);
   double radial_area_integral = 0.0;
   for (const auto& [unit_node, unit_weight] :
-       gauss_legendre_unit_interval(
+       cached_gauss_legendre_unit_interval(
            context.options.aperture_edge_phi_order)) {
     const double phi =
         phi_min + (phi_max - phi_min) * unit_node;
@@ -1642,6 +1695,221 @@ double projected_aperture_coverage(
     throw std::runtime_error(
         "projected aperture cell has zero area");
   return std::clamp(covered_area / cell_area, 0.0, 1.0);
+}
+
+std::optional<double> projected_cylinder_visible_solid_angle(
+    const ShapeFactorTraceContext& context,
+    const AnalyticSurfaceElement& element) {
+  const auto missing = std::numeric_limits<std::uint32_t>::max();
+  if (element.coordinates !=
+          AnalyticSurfaceCoordinates::cylinder_phi_z ||
+      element.projected_aperture_primitive_index == missing ||
+      element.projected_aperture_hole_index == missing)
+    return std::nullopt;
+  const auto& receiver = context.scene.mesh.analytic_primitives.at(
+      element.primitive_index);
+  const auto& aperture = context.scene.mesh.analytic_primitives.at(
+      element.projected_aperture_primitive_index);
+  if (receiver.kind != GeometryPrimitiveKind::finite_cylinder ||
+      aperture.kind != GeometryPrimitiveKind::perforated_disk)
+    throw std::runtime_error(
+        "projected cylinder source element has invalid primitives");
+  if (element.projected_aperture_hole_index >= aperture.holes.size())
+    throw std::runtime_error(
+        "projected cylinder source element has invalid aperture hole");
+  const auto& hole =
+      aperture.holes.at(element.projected_aperture_hole_index);
+  const Vec3 hole_center =
+      add(aperture.center_mm,
+          add(scale(aperture.axis_x, hole.center_uv_mm.x),
+              scale(aperture.axis_y, hole.center_uv_mm.y)));
+  const Vec3 source = context.source.position;
+  const double phi_span = element.bounds[1] - element.bounds[0];
+  const double z_span = element.bounds[3] - element.bounds[2];
+  const double radius = receiver.parameters[0];
+  const auto& nodes = cached_gauss_legendre_unit_interval(
+      context.options.aperture_edge_phi_order);
+  const auto integrate_2d = [&]() {
+    const double aperture_numerator =
+        dot(subtract(aperture.center_mm, source), aperture.axis_z);
+    double solid_angle = 0.0;
+    for (const auto& [phi_node, phi_weight] : nodes) {
+      const double phi = element.bounds[0] + phi_span * phi_node;
+      const Vec3 radial =
+          add(scale(receiver.axis_x, std::cos(phi)),
+              scale(receiver.axis_y, std::sin(phi)));
+      const Vec3 sample_normal =
+          scale(radial, receiver.normal_sign >= 0.0 ? 1.0 : -1.0);
+      for (const auto& [z_node, z_weight] : nodes) {
+        const double local_z = element.bounds[2] + z_span * z_node;
+        const Vec3 point =
+            add(receiver.center_mm,
+                add(scale(radial, radius),
+                    scale(receiver.axis_z, local_z)));
+        const Vec3 displacement = subtract(point, source);
+        const double distance = norm(displacement);
+        if (!(distance > 0.0))
+          throw std::runtime_error(
+              "shape-factor source lies on a projected cylinder element");
+        const double projected_cosine =
+            std::max(0.0, dot(displacement, sample_normal) / distance);
+        if (!(projected_cosine > 0.0)) continue;
+        const double denominator = dot(displacement, aperture.axis_z);
+        if (std::abs(denominator) <=
+            64.0 * std::numeric_limits<double>::epsilon())
+          continue;
+        const double fraction = aperture_numerator / denominator;
+        if (fraction < 0.0 || fraction > 1.0) continue;
+        const Vec3 projected = add(source, scale(displacement, fraction));
+        const Vec3 relative = subtract(projected, hole_center);
+        const double projected_radius_squared =
+            std::pow(dot(relative, aperture.axis_x), 2) +
+            std::pow(dot(relative, aperture.axis_y), 2);
+        if (projected_radius_squared > hole.radius_mm * hole.radius_mm)
+          continue;
+        solid_angle +=
+            phi_weight * z_weight * radius * phi_span * z_span *
+            projected_cosine / (distance * distance);
+      }
+    }
+    return solid_angle;
+  };
+
+  // In a coaxial circular tunnel the aperture mask is the shadow of one
+  // circle on another.  For fixed phi its visible wall height is analytic,
+  // as is the complete z solid-angle integral.  Only a smooth, piecewise
+  // one-dimensional phi integral remains.  Keep the two-dimensional rule as
+  // a conservative fallback for non-coaxial imported geometry.
+  const double geometry_scale =
+      std::max({1.0, radius, hole.radius_mm,
+                norm(subtract(source, hole_center))});
+  const double geometry_tolerance =
+      64.0 * std::max(context.scene.numerics.geometry_tolerance_mm,
+                      std::numeric_limits<double>::epsilon() *
+                          geometry_scale);
+  if (std::abs(std::abs(dot(receiver.axis_z, aperture.axis_z)) - 1.0) >
+          64.0 * std::numeric_limits<double>::epsilon() ||
+      std::abs(radius - hole.radius_mm) > geometry_tolerance)
+    return integrate_2d();
+  const Vec3 cylinder_to_hole =
+      subtract(hole_center, receiver.center_mm);
+  const double aperture_local_z =
+      dot(cylinder_to_hole, receiver.axis_z);
+  const Vec3 aperture_axis_offset =
+      subtract(cylinder_to_hole,
+               scale(receiver.axis_z, aperture_local_z));
+  if (norm(aperture_axis_offset) > geometry_tolerance)
+    return integrate_2d();
+
+  const double wall_midpoint =
+      0.5 * (element.bounds[2] + element.bounds[3]);
+  const double wall_side = wall_midpoint - aperture_local_z;
+  const double source_local_z =
+      dot(subtract(source, receiver.center_mm), receiver.axis_z);
+  const double source_side = source_local_z - aperture_local_z;
+  if (std::abs(wall_side) <= geometry_tolerance ||
+      wall_side * source_side >= 0.0)
+    return integrate_2d();
+  const double axial_sign = wall_side > 0.0 ? 1.0 : -1.0;
+  double wall_z0 =
+      axial_sign * (element.bounds[2] - aperture_local_z);
+  double wall_z1 =
+      axial_sign * (element.bounds[3] - aperture_local_z);
+  if (wall_z1 < wall_z0) std::swap(wall_z0, wall_z1);
+  if (wall_z0 < -geometry_tolerance)
+    return integrate_2d();
+  wall_z0 = std::max(0.0, wall_z0);
+  const double source_depth = -axial_sign * source_side;
+  if (!(source_depth > geometry_tolerance)) return integrate_2d();
+
+  const Vec3 source_from_axis = subtract(source, hole_center);
+  const double source_x = dot(source_from_axis, receiver.axis_x);
+  const double source_y = dot(source_from_axis, receiver.axis_y);
+  const double source_radius_squared =
+      source_x * source_x + source_y * source_y;
+  const double source_radius = std::sqrt(source_radius_squared);
+  const double radial_excess =
+      source_radius_squared - radius * radius;
+  const double source_phi = std::atan2(source_y, source_x);
+
+  std::vector<double> phi_breaks{element.bounds[0], element.bounds[1]};
+  const auto append_visibility_breaks = [&](double wall_z) {
+    if (!(radial_excess > 0.0) || !(source_radius > 0.0)) return;
+    const double cosine =
+        (radius - wall_z * radial_excess /
+                      (2.0 * source_depth * radius)) /
+        source_radius;
+    if (cosine < -1.0 || cosine > 1.0) return;
+    const double offset = std::acos(std::clamp(cosine, -1.0, 1.0));
+    for (const double base : {source_phi - offset,
+                              source_phi + offset}) {
+      const auto first_period = static_cast<long long>(std::ceil(
+          (element.bounds[0] - base) / (2.0 * pi)));
+      const auto last_period = static_cast<long long>(std::floor(
+          (element.bounds[1] - base) / (2.0 * pi)));
+      for (long long period = first_period; period <= last_period;
+           ++period) {
+        const double value = base + 2.0 * pi * period;
+        if (value > element.bounds[0] + 1.0e-14 &&
+            value < element.bounds[1] - 1.0e-14)
+          phi_breaks.push_back(value);
+      }
+    }
+  };
+  append_visibility_breaks(wall_z0);
+  append_visibility_breaks(wall_z1);
+  std::sort(phi_breaks.begin(), phi_breaks.end());
+  phi_breaks.erase(
+      std::unique(phi_breaks.begin(), phi_breaks.end(),
+                  [](double first, double second) {
+                    return std::abs(first - second) <= 1.0e-13;
+                  }),
+      phi_breaks.end());
+
+  double solid_angle = 0.0;
+  for (std::size_t segment = 0; segment + 1 < phi_breaks.size();
+       ++segment) {
+    const double phi_min = phi_breaks[segment];
+    const double phi_max = phi_breaks[segment + 1];
+    const double segment_span = phi_max - phi_min;
+    if (!(segment_span > 0.0)) continue;
+    for (const auto& [phi_node, phi_weight] : nodes) {
+      const double phi = phi_min + segment_span * phi_node;
+      const double source_projection =
+          source_x * std::cos(phi) + source_y * std::sin(phi);
+      const double outward_projection = radius - source_projection;
+      const double normal_projection =
+          (receiver.normal_sign >= 0.0 ? 1.0 : -1.0) *
+          outward_projection;
+      if (!(outward_projection > 0.0) || !(normal_projection > 0.0))
+        continue;
+      double visible_z1 = wall_z1;
+      if (radial_excess > 0.0)
+        visible_z1 = std::min(
+            visible_z1,
+            2.0 * source_depth * radius * outward_projection /
+                radial_excess);
+      if (!(visible_z1 > wall_z0)) continue;
+      const double transverse_distance_squared =
+          radius * radius + source_radius_squared -
+          2.0 * radius * source_projection;
+      if (!(transverse_distance_squared > 0.0))
+        throw std::runtime_error(
+            "shape-factor source lies on a projected cylinder element");
+      const double lower_t = source_depth + wall_z0;
+      const double upper_t = source_depth + visible_z1;
+      const auto axial_primitive =
+          [transverse_distance_squared](double value) {
+            return value /
+                   std::sqrt(transverse_distance_squared + value * value);
+          };
+      solid_angle +=
+          segment_span * phi_weight * radius * normal_projection /
+          transverse_distance_squared *
+          (axial_primitive(upper_t) - axial_primitive(lower_t));
+    }
+  }
+  return solid_angle;
 }
 
 bool accumulate_simple_structured_hit(
@@ -1708,12 +1976,24 @@ void accumulate_shape_factor_analytic_element(
   const Vec3 direction = scale(displacement, 1.0 / distance);
   const double projected_cosine =
       std::max(0.0, dot(direction, element.normal));
-  if (!(projected_cosine > 0.0)) return;
+  const auto& primitive =
+      context.scene.mesh.analytic_primitives.at(element.primitive_index);
+  const auto projected_cylinder_solid_angle =
+      projected_cylinder_visible_solid_angle(context, element);
+  if (!projected_cylinder_solid_angle && !(projected_cosine > 0.0))
+    return;
+  const double solid_angle = projected_cylinder_solid_angle.value_or(
+      exact_plane_rectangle_solid_angle(
+          context.source.position, primitive, element)
+          .value_or(projected_cosine * element.area_mm2 /
+                    (distance * distance)));
+  if (!(solid_angle > 0.0)) return;
   const double unmasked_weight =
-      context.source.stokes.i * projected_cosine * element.area_mm2 /
-      (4.0 * pi * distance * distance);
-  const double coverage = projected_aperture_coverage(
-      context, element, unmasked_weight);
+      context.source.stokes.i * solid_angle / (4.0 * pi);
+  const double coverage =
+      projected_cylinder_solid_angle
+          ? 1.0
+          : projected_aperture_coverage(context, element, unmasked_weight);
   if (!(coverage > 0.0)) return;
   const auto expected_key =
       analytic_surface_element_geometry_key(element_index);
@@ -1721,9 +2001,6 @@ void accumulate_shape_factor_analytic_element(
       context.options.backend != ShapeFactorBackend::generic_bvh &&
       element.source_visibility != AnalyticSourceVisibility::ray_traced;
   const auto declared_hit = [&]() {
-    const auto& primitive =
-        context.scene.mesh.analytic_primitives.at(
-            element.primitive_index);
     return Hit{true,
                primitive.kind,
                expected_key,
@@ -2045,7 +2322,18 @@ double trace_shape_factor_point(
   std::vector<std::uint32_t> analytic_elements;
   analytic_elements.reserve(domain_candidates.analytic_elements.size());
   for (const auto& candidate : domain_candidates.analytic_elements) {
-    if (dot(subtract(candidate.center, source.position),
+    const auto& element =
+        scene.mesh.analytic_surface_elements.at(candidate.index);
+    const auto missing = std::numeric_limits<std::uint32_t>::max();
+    const bool projected_cylinder =
+        element.coordinates ==
+            AnalyticSurfaceCoordinates::cylinder_phi_z &&
+        element.projected_aperture_primitive_index != missing &&
+        element.projected_aperture_hole_index != missing;
+    // A coarse projected-cylinder panel may straddle visible and back-facing
+    // parts of a circular tunnel, so its centroid cannot reject the panel.
+    if (projected_cylinder ||
+        dot(subtract(candidate.center, source.position),
             candidate.outward) > 0.0)
       analytic_elements.push_back(candidate.index);
   }
@@ -2333,34 +2621,70 @@ std::vector<NonlocalEgress> payload_egress(
   return result;
 }
 
-std::vector<std::uint32_t> surface_primitives(const Scene& scene,
-                                              std::uint32_t surface_id) {
-  std::vector<std::uint32_t> result;
+struct NonlocalEgressGeometryIndex {
+  std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
+      triangle_primitives;
+  std::unordered_map<
+      std::uint32_t,
+      std::unordered_map<std::uint64_t, std::uint32_t>>
+      analytic_elements;
+  std::unordered_map<std::uint32_t, std::unordered_set<std::uint64_t>>
+      ambiguous_analytic_elements;
+};
+
+NonlocalEgressGeometryIndex make_nonlocal_egress_geometry_index(
+    const Scene& scene) {
+  NonlocalEgressGeometryIndex result;
   for (std::uint32_t primitive = 0;
-       primitive < scene.mesh.surface_id.size(); ++primitive)
-    if (scene.mesh.surface_id[primitive] == surface_id &&
-        (scene.mesh.triangle_transport.empty() ||
-         scene.mesh.triangle_transport.at(primitive) != 0))
-      result.push_back(primitive);
+       primitive < scene.mesh.surface_id.size(); ++primitive) {
+    if (!scene.mesh.triangle_transport.empty() &&
+        scene.mesh.triangle_transport.at(primitive) == 0)
+      continue;
+    result.triangle_primitives[scene.mesh.surface_id.at(primitive)]
+        .push_back(primitive);
+  }
+  for (std::uint32_t element_index = 0;
+       element_index < scene.mesh.analytic_surface_elements.size();
+       ++element_index) {
+    const auto& element =
+        scene.mesh.analytic_surface_elements.at(element_index);
+    const auto surface_id =
+        scene.mesh.analytic_primitives.at(element.primitive_index).surface_id;
+    const auto [entry, inserted] =
+        result.analytic_elements[surface_id].emplace(
+            element.surface_element, element_index);
+    (void)entry;
+    if (!inserted)
+      result.ambiguous_analytic_elements[surface_id].insert(
+          element.surface_element);
+  }
   return result;
 }
 
 WeightedRay egress_ray(const Scene& scene, std::uint32_t surface_id,
+                       const NonlocalEgressGeometryIndex& geometry_index,
                        const NonlocalEgress& egress, double nudge,
                        double weight = 1.0) {
   const AnalyticSurfaceElement* analytic_element = nullptr;
   const AnalyticPrimitive* analytic_primitive = nullptr;
-  for (const auto& element : scene.mesh.analytic_surface_elements) {
-    const auto& primitive =
-        scene.mesh.analytic_primitives.at(element.primitive_index);
-    if (primitive.surface_id != surface_id ||
-        element.surface_element != egress.surface_element)
-      continue;
-    if (analytic_element != nullptr)
-      throw std::runtime_error(
-          "nonlocal egress surface element is ambiguous");
-    analytic_element = &element;
-    analytic_primitive = &primitive;
+  const auto ambiguous_surface =
+      geometry_index.ambiguous_analytic_elements.find(surface_id);
+  if (ambiguous_surface !=
+          geometry_index.ambiguous_analytic_elements.end() &&
+      ambiguous_surface->second.count(egress.surface_element) != 0)
+    throw std::runtime_error(
+        "nonlocal egress surface element is ambiguous");
+  const auto analytic_surface =
+      geometry_index.analytic_elements.find(surface_id);
+  if (analytic_surface != geometry_index.analytic_elements.end()) {
+    const auto found =
+        analytic_surface->second.find(egress.surface_element);
+    if (found != analytic_surface->second.end()) {
+      analytic_element =
+          &scene.mesh.analytic_surface_elements.at(found->second);
+      analytic_primitive = &scene.mesh.analytic_primitives.at(
+          analytic_element->primitive_index);
+    }
   }
   if (analytic_element != nullptr) {
     const Vec3 point = analytic_element->center_mm;
@@ -2410,11 +2734,14 @@ WeightedRay egress_ray(const Scene& scene, std::uint32_t surface_id,
              weight * egress.stokes.v},
             reference_axis, domain, 0, std::nullopt};
   }
-  const auto primitives = surface_primitives(scene, surface_id);
-  if (egress.surface_element >= primitives.size())
+  const auto triangle_surface =
+      geometry_index.triangle_primitives.find(surface_id);
+  if (triangle_surface == geometry_index.triangle_primitives.end() ||
+      egress.surface_element >= triangle_surface->second.size())
     throw std::runtime_error(
         "nonlocal egress surface element lies outside its own surface");
-  const auto primitive = primitives.at(egress.surface_element);
+  const auto primitive =
+      triangle_surface->second.at(egress.surface_element);
   const auto triangle = scene.mesh.triangles.at(primitive);
   Vec3 point{};
   for (int vertex = 0; vertex < 3; ++vertex)
@@ -2707,6 +3034,8 @@ std::string OperatorBuilder::cache_key(const Scene& scene) {
 OperatorSet OperatorBuilder::build(const Scene& scene) {
   SceneValidator::validate(scene).throw_if_invalid();
   Geometry geometry(scene);
+  const auto nonlocal_egress_geometry_index =
+      make_nonlocal_egress_geometry_index(scene);
   const auto local_basis = make_local_surface_basis(scene);
   const auto& state_emitters = local_basis.state_emitters;
   const auto& primitive_to_state = local_basis.primitive_to_state;
@@ -2862,7 +3191,8 @@ OperatorSet OperatorBuilder::build(const Scene& scene) {
       try {
         trace_branch(scene, geometry, primitive_to_state, channel_to_column,
                      custom_runtimes,
-                     egress_ray(scene, surface_id, egress[index],
+                     egress_ray(scene, surface_id,
+                                nonlocal_egress_geometry_index, egress[index],
                                 geometry.ray_origin_offset_mm()),
                      egress_rows[index]);
       } catch (...) {

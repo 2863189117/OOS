@@ -62,9 +62,10 @@ struct ShapeFactorOptions {
   // to the exact atan2 solid-angle formula. Zero preserves exact-only
   // weighting.
   double maximum_approximate_solid_angle_fraction{1.0e-5};
-  // Finite polar cells that project across a circular aperture use this
-  // Gauss-Legendre order in azimuth.  Cells below the weight threshold retain
-  // the center-visibility decision used by the optimized path.
+  // Finite cells that project across a circular aperture use this
+  // Gauss-Legendre order in azimuth. Annular cells below the weight threshold
+  // retain the optimized center decision; coaxial cylinder cells instead use
+  // exact axial clipping and integration at every weight.
   std::uint32_t aperture_edge_phi_order{8};
   double aperture_edge_weight_threshold{1.0e-7};
   // Order 31 selects an embedded Gauss-Kronrod 15/31 rule in direction
