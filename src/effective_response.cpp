@@ -170,13 +170,14 @@ EffectiveResponse build_effective_response_cpu(const OperatorSet& operators,
                                                 std::uint32_t cycles,
                                                 std::uint64_t batch_size) {
   operators.validate();
-  if (batch_size == 0)
-    throw std::runtime_error("effective response batch size must be positive");
-  const bool automatic_cycles = cycles == 0;
+  if (cycles == 0 || batch_size == 0)
+    throw std::runtime_error(
+        "effective response cycles and batch size must be positive");
   EffectiveResponse response;
   response.states = operators.transition.rows;
   response.channels = operators.detection.cols;
   response.losses = operators.losses.cols;
+  response.cycles = cycles;
   response.build_batch_size = batch_size;
   response.operator_tolerance = operators.tolerance;
   response.state_to_detection.assign(response.states * response.channels,
@@ -188,39 +189,6 @@ EffectiveResponse build_effective_response_cpu(const OperatorSet& operators,
   response.operator_cache_key_sha256 = operators.cache_key_sha256;
   response.code_commit = operators.code_commit;
   const auto functions = load_functions(operators);
-
-  const std::vector<double> no_detection(response.channels, 0.0);
-  const std::vector<double> no_loss(response.losses, 0.0);
-  const auto unresolved_after = [&](std::uint32_t count) {
-    std::vector<double> unresolved(response.states, 1.0);
-    for (std::uint32_t cycle = 0; cycle < count; ++cycle)
-      unresolved = apply_adjoint_cycle(
-          operators, functions, unresolved, no_detection, no_loss, 1);
-    return unresolved;
-  };
-  std::vector<double> automatic_unresolved;
-  if (automatic_cycles) {
-    if (operators.maximum_iterations == 0)
-      throw std::runtime_error(
-          "automatic adjoint iteration limit must be positive");
-    automatic_unresolved.assign(response.states, 1.0);
-    bool converged = false;
-    for (cycles = 1; cycles <= operators.maximum_iterations; ++cycles) {
-      automatic_unresolved = apply_adjoint_cycle(
-          operators, functions, automatic_unresolved, no_detection, no_loss,
-          1);
-      const double maximum = *std::max_element(
-          automatic_unresolved.begin(), automatic_unresolved.end());
-      if (maximum <= operators.tolerance) {
-        converged = true;
-        break;
-      }
-    }
-    if (!converged)
-      throw std::runtime_error(
-          "automatic adjoint effective response did not converge");
-  }
-  response.cycles = cycles;
 
   const auto build_terminal =
       [&](std::uint64_t terminal_count, bool detection,
@@ -253,9 +221,13 @@ EffectiveResponse build_effective_response_cpu(const OperatorSet& operators,
   build_terminal(response.channels, true, response.state_to_detection);
   build_terminal(response.losses, false, response.state_to_losses);
 
-  response.state_unresolved = automatic_cycles
-                                  ? std::move(automatic_unresolved)
-                                  : unresolved_after(cycles);
+  std::vector<double> unresolved_state(response.states, 1.0);
+  const std::vector<double> no_detection(response.channels, 0.0);
+  const std::vector<double> no_loss(response.losses, 0.0);
+  for (std::uint32_t cycle = 0; cycle < cycles; ++cycle)
+    unresolved_state = apply_adjoint_cycle(
+        operators, functions, unresolved_state, no_detection, no_loss, 1);
+  response.state_unresolved = std::move(unresolved_state);
   response.fingerprint_sha256 = effective_response_fingerprint(response);
   response.validate();
   return response;

@@ -12,7 +12,7 @@ struct HitBatch;
 SolveResult solve_cuda(const OperatorSet& operators, const SourceBatch& sources,
                        SolveControl control = {});
 EffectiveResponse build_effective_response_cuda(
-    const OperatorSet& operators, std::uint32_t cycles = 0,
+    const OperatorSet& operators, std::uint32_t cycles = 7,
     std::uint64_t batch_size = 64);
 
 class CudaEffectiveResponseRuntime {

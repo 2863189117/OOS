@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -16,7 +15,7 @@ void usage() {
   std::cerr
       << "usage:\n"
       << "  oos-efficiency precompute operators.h5 --output effective.h5 "
-         "[--cycles auto|N] [--batch-size 64] [--device cpu|cuda]\n"
+         "[--cycles 7] [--batch-size 64] [--device cpu|cuda]\n"
       << "  oos-efficiency calculate operators.h5 --sources sources.yaml|"
          "source_batch.h5 --output response.h5 [--scene scene.yaml] "
          "[--surface-basis selection.h5] [--precomputed effective.h5] "
@@ -34,12 +33,6 @@ bool flag(int argc, char** argv, const std::string& name) {
   for (int i = 0; i < argc; ++i)
     if (argv[i] == name) return true;
   return false;
-}
-
-std::uint32_t cycle_option(int argc, char** argv) {
-  const auto value = option(argc, argv, "--cycles", "auto");
-  if (value == "auto") return 0;
-  return static_cast<std::uint32_t>(std::stoul(value));
 }
 
 oos::Scene configured_scene(int argc, char** argv,
@@ -111,7 +104,9 @@ int main(int argc, char** argv) {
     if (command == "precompute") {
       const auto output = option(argc, argv, "--output");
       if (output.empty()) throw std::runtime_error("--output is required");
-      const auto cycles = cycle_option(argc, argv);
+      const auto cycles =
+          static_cast<std::uint32_t>(
+              std::stoul(option(argc, argv, "--cycles", "7")));
       const auto batch_size =
           static_cast<std::uint64_t>(
               std::stoull(option(argc, argv, "--batch-size", "64")));
@@ -146,9 +141,8 @@ int main(int argc, char** argv) {
         }
       } else {
         auto effective_path = option(argc, argv, "--precomputed");
-        const bool explicitly_precomputed = !effective_path.empty();
-        if (!explicitly_precomputed)
-          effective_path = operator_path.string() + ".auto-cycle.h5";
+        if (effective_path.empty())
+          effective_path = operator_path.string() + ".seven-cycle.h5";
         bool rebuild =
             !std::filesystem::is_regular_file(effective_path);
         if (!rebuild) {
@@ -156,11 +150,7 @@ int main(int argc, char** argv) {
             const auto cached =
                 oos::load_effective_response_hdf5(effective_path);
             rebuild = cached.operator_cache_key_sha256 !=
-                          operators.cache_key_sha256 ||
-                      (!explicitly_precomputed &&
-                       *std::max_element(cached.state_unresolved.begin(),
-                                         cached.state_unresolved.end()) >
-                           operators.tolerance);
+                      operators.cache_key_sha256;
             if (rebuild)
               std::cout << "effective response cache stale: "
                         << effective_path << '\n';
@@ -171,7 +161,7 @@ int main(int argc, char** argv) {
           }
         }
         if (rebuild) {
-          auto response = build_response(operators, device, 0, 64);
+          auto response = build_response(operators, device, 7, 64);
           auto temporary = std::filesystem::path(effective_path);
           temporary += ".tmp";
           oos::save_effective_response_hdf5(temporary, response);

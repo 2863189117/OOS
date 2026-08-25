@@ -172,21 +172,15 @@ def write_factorized_block(
     reference_axis_local: np.ndarray,
     phase_grid: dict[str, Any],
     audit_names: list[str],
-    surface_ring_offsets: np.ndarray | None = None,
-    surface_phi_rad: np.ndarray | None = None,
-    surface_area_mm2: np.ndarray | None = None,
     metadata: dict[str, Any] | None = None,
     tolerance: float = 1.0e-10,
 ) -> None:
     """Write a canonical matrix-free LXe function block.
 
     ``coefficients`` retain the Fourier--Bessel factorization used by the
-    explicit-seven-collision/diffusion generator.  Rank-five coefficients use
-    the legacy position-only surface marginal; rank-six coefficients add the
-    egress-angle axis and therefore preserve the joint exit position and gas
-    direction.  Geometry-dependent egress destinations are deliberately
-    absent: the payload contains only points and polarized directions relative
-    to its own surface group.
+    explicit-seven-collision/diffusion generator.  Geometry-dependent egress
+    destinations are deliberately absent: the payload contains only points
+    and polarized directions relative to its own surface group.
     """
 
     modes = np.asarray(coefficients, dtype=np.complex128)
@@ -201,16 +195,6 @@ def write_factorized_block(
     direction = np.asarray(direction_local, dtype=np.float64)
     polarization = np.asarray(stokes, dtype=np.float64)
     reference = np.asarray(reference_axis_local, dtype=np.float64)
-    ragged_values = (
-        surface_ring_offsets,
-        surface_phi_rad,
-        surface_area_mm2,
-    )
-    ragged = any(value is not None for value in ragged_values)
-    if ragged and not all(value is not None for value in ragged_values):
-        raise ValueError(
-            "ragged surface layout requires offsets, phi, and area together"
-        )
 
     required_grid = (
         "position_radial_bins",
@@ -221,7 +205,7 @@ def write_factorized_block(
     if any(int(phase_grid.get(name, 0)) <= 0 for name in required_grid):
         raise ValueError("phase_grid is incomplete")
     nr, np_, nm, nd = (int(phase_grid[name]) for name in required_grid)
-    if modes.ndim not in (5, 6) or modes.shape[:3] != (nd, nr, nm):
+    if modes.ndim != 5 or modes.shape[:3] != (nd, nr, nm):
         raise ValueError("factorized coefficient array has wrong phase shape")
     if expected.shape != (nd, nr, nm):
         raise ValueError("expected_return has wrong shape")
@@ -231,17 +215,6 @@ def write_factorized_block(
         raise ValueError("audit_names do not match audit_values")
     if modes.shape[4] != radius.size or ring_area.shape != radius.shape:
         raise ValueError("surface radial quadrature does not match coefficients")
-    joint_angular = modes.ndim == 6
-    if joint_angular and modes.shape[5] != angular.size:
-        raise ValueError("joint coefficient angle axis does not match angular_weight")
-    if (
-        np.any(~np.isfinite(modes))
-        or np.any(~np.isfinite(radius))
-        or np.any(radius < 0.0)
-        or np.any(~np.isfinite(ring_area))
-        or np.any(ring_area <= 0.0)
-    ):
-        raise ValueError("modal coefficients or radial quadrature are invalid")
     if (
         np.any(~np.isfinite(expected))
         or np.any(expected < -tolerance)
@@ -267,46 +240,9 @@ def write_factorized_block(
     ):
         raise ValueError("egress arrays have inconsistent shapes")
     surface_points = egress_count // angular.size
-    if ragged:
-        ring_offsets = np.asarray(surface_ring_offsets, dtype=np.uint64)
-        surface_phi = np.asarray(surface_phi_rad, dtype=np.float64)
-        surface_area = np.asarray(surface_area_mm2, dtype=np.float64)
-        if (
-            ring_offsets.shape != (radius.size + 1,)
-            or ring_offsets[0] != 0
-            or ring_offsets[-1] != surface_points
-            or np.any(np.diff(ring_offsets.astype(np.int64)) <= 0)
-        ):
-            raise ValueError("surface_ring_offsets do not partition the rings")
-        if surface_phi.shape != (surface_points,) or surface_area.shape != (
-            surface_points,
-        ):
-            raise ValueError("ragged surface arrays have inconsistent shapes")
-        if (
-            np.any(~np.isfinite(surface_phi))
-            or np.any(surface_phi < 0.0)
-            or np.any(surface_phi >= 2.0 * np.pi)
-            or np.any(~np.isfinite(surface_area))
-            or np.any(surface_area <= 0.0)
-        ):
-            raise ValueError("ragged surface phi/area values are invalid")
-        area_by_ring = np.add.reduceat(
-            surface_area, ring_offsets[:-1].astype(np.int64)
-        )
-        if not np.allclose(
-            area_by_ring,
-            ring_area,
-            rtol=2.0e-12,
-            atol=max(tolerance, 5.0e-8),
-        ):
-            raise ValueError(
-                "ragged point areas do not reproduce the modal ring areas"
-            )
-        surface_phi_bins = None
-    else:
-        surface_phi_bins = surface_points // radius.size
-        if surface_phi_bins * radius.size != surface_points:
-            raise ValueError("egress basis does not match the radial quadrature")
+    surface_phi_bins = surface_points // radius.size
+    if surface_phi_bins * radius.size != surface_points:
+        raise ValueError("egress basis does not match the radial quadrature")
     if np.any(output_side > 1):
         raise ValueError("egress side must be zero or one")
     if np.any(bary < 0.0) or not np.allclose(
@@ -338,34 +274,17 @@ def write_factorized_block(
         producer_metadata["coefficient_row_count"] = int(
             coefficient_row_count
         )
-    payload: dict[str, Any] = {
+    payload = {
         **producer_metadata,
-        "schema": (
-            "oos.nonlocal.function.v2"
-            if ragged
-            else "oos.nonlocal.function.v1"
-        ),
+        "schema": "oos.nonlocal.function.v1",
         "surface_relative": True,
         "execution": "function",
         "state_count": state_count,
         "egress_count": egress_count,
+        "surface_phi_bins": surface_phi_bins,
         "angular_count": int(angular.size),
         "contraction_bound": float(np.max(expected)),
     }
-    if joint_angular:
-        payload["coefficient_layout"] = "joint_surface_angle_v1"
-    if ragged:
-        payload.update(
-            {
-                "surface_layout": "ragged_ring_v1",
-                "surface_point_count": surface_points,
-            }
-        )
-        payload.pop("surface_phi_bins", None)
-    else:
-        payload["surface_phi_bins"] = surface_phi_bins
-        payload.pop("surface_layout", None)
-        payload.pop("surface_point_count", None)
     output.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(output, "w") as handle:
         root = handle.create_group("nonlocal")
@@ -390,12 +309,6 @@ def write_factorized_block(
         function.create_dataset("audit_values", data=audit)
         function.create_dataset("surface_radius_mm", data=radius)
         function.create_dataset("surface_ring_area_mm2", data=ring_area)
-        if ragged:
-            function.create_dataset(
-                "surface_ring_offsets", data=ring_offsets
-            )
-            function.create_dataset("surface_phi_rad", data=surface_phi)
-            function.create_dataset("surface_area_mm2", data=surface_area)
         function.create_dataset("angular_weight", data=angular)
 
         meta = handle.create_group("metadata")

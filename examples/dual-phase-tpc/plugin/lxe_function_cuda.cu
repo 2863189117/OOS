@@ -15,10 +15,6 @@ struct CudaState {
   cuDoubleComplex* coefficients{};
   double* expected_return{};
   double* surface_ring_area{};
-  std::uint64_t* surface_ring_offsets{};
-  std::uint64_t* surface_ring_index{};
-  double* surface_phi_rad{};
-  double* surface_area_mm2{};
   double* angular_weight{};
   cuDoubleComplex* phase_modes{};
   cuDoubleComplex* modal_surface{};
@@ -28,25 +24,6 @@ struct CudaState {
 };
 
 bool okay(cudaError_t status) { return status == cudaSuccess; }
-
-void release_constants(CudaState& state) {
-  cudaFree(state.coefficients);
-  cudaFree(state.expected_return);
-  cudaFree(state.surface_ring_area);
-  cudaFree(state.surface_ring_offsets);
-  cudaFree(state.surface_ring_index);
-  cudaFree(state.surface_phi_rad);
-  cudaFree(state.surface_area_mm2);
-  cudaFree(state.angular_weight);
-  state.coefficients = nullptr;
-  state.expected_return = nullptr;
-  state.surface_ring_area = nullptr;
-  state.surface_ring_offsets = nullptr;
-  state.surface_ring_index = nullptr;
-  state.surface_phi_rad = nullptr;
-  state.surface_area_mm2 = nullptr;
-  state.angular_weight = nullptr;
-}
 
 void release_scratch(CudaState& state) {
   cudaFree(state.phase_modes);
@@ -69,11 +46,9 @@ bool ensure_capacity(const LXeFunctionInstance& function, CudaState& state,
   const auto phase_mode_count =
       batch * function.nr * function.nm * function.nd * function.orders;
   const auto modal_count =
-      batch * function.orders * function.surface_radial *
-      (function.joint_angular ? function.angular : 1);
+      batch * function.orders * function.surface_radial;
   const auto surface_count =
-      batch * function.surface_points *
-      (function.joint_angular ? function.angular : 1);
+      batch * function.surface_radial * function.surface_phi;
   if (!okay(cudaMalloc(&state.phase_modes,
                        phase_mode_count * sizeof(cuDoubleComplex))) ||
       !okay(cudaMalloc(&state.modal_surface,
@@ -159,46 +134,6 @@ __global__ void modal_surface_kernel(
   output[linear] = result;
 }
 
-__global__ void modal_surface_joint_kernel(
-    const cuDoubleComplex* phase_modes,
-    const cuDoubleComplex* coefficients, std::uint64_t batch,
-    std::uint64_t nr, std::uint64_t nm, std::uint64_t nd,
-    std::uint64_t orders, std::uint64_t surface_radial,
-    std::uint64_t angular, cuDoubleComplex* output) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * orders * surface_radial * angular;
-  if (linear >= count) return;
-  auto value = linear;
-  const auto angle = value % angular;
-  value /= angular;
-  const auto surface = value % surface_radial;
-  value /= surface_radial;
-  const auto order = value % orders;
-  const auto row = value / orders;
-  cuDoubleComplex result = make_cuDoubleComplex(0.0, 0.0);
-  for (std::uint64_t radial = 0; radial < nr; ++radial)
-    for (std::uint64_t mu = 0; mu < nm; ++mu)
-      for (std::uint64_t direction_phi = 0; direction_phi < nd;
-           ++direction_phi) {
-        const auto phase_index =
-            ((((row * nr + radial) * nm + mu) * nd + direction_phi) *
-                 orders +
-             order);
-        const auto coefficient_index =
-            (((((direction_phi * nr + radial) * nm + mu) * orders + order) *
-                   surface_radial +
-               surface) *
-                  angular +
-              angle);
-        result = cuCadd(
-            result,
-            cuCmul(phase_modes[phase_index],
-                   coefficients[coefficient_index]));
-      }
-  output[linear] = result;
-}
-
 __global__ void input_totals_kernel(
     const double* input, const double* expected_return,
     std::uint64_t batch, std::uint64_t nr, std::uint64_t np,
@@ -275,96 +210,6 @@ __global__ void surface_weights_kernel(
       static_cast<double>(surface_phi);
 }
 
-__global__ void surface_weights_ragged_kernel(
-    const cuDoubleComplex* modal_surface,
-    const std::uint64_t* ring_index, const double* surface_phi_rad,
-    const double* surface_area_mm2, std::uint64_t batch,
-    std::uint64_t orders, std::uint64_t surface_radial,
-    std::uint64_t surface_points, double* surface_weight) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * surface_points;
-  if (linear >= count) return;
-  const auto point = linear % surface_points;
-  const auto row = linear / surface_points;
-  const auto surface = ring_index[point];
-  const double phi = surface_phi_rad[point];
-  cuDoubleComplex density = make_cuDoubleComplex(0.0, 0.0);
-  for (std::uint64_t order = 0; order < orders; ++order) {
-    const auto mode =
-        modal_surface[(row * orders + order) * surface_radial + surface];
-    const auto basis =
-        make_cuDoubleComplex(cos(order * phi), sin(order * phi));
-    density = cuCadd(density, cuCmul(mode, basis));
-  }
-  surface_weight[linear] =
-      cuCreal(density) * surface_area_mm2[point];
-}
-
-__global__ void surface_egress_joint_kernel(
-    const cuDoubleComplex* modal_surface, const double* ring_area,
-    std::uint64_t batch, std::uint64_t orders,
-    std::uint64_t surface_radial, std::uint64_t surface_phi,
-    std::uint64_t angular, double* egress) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * surface_radial * surface_phi * angular;
-  if (linear >= count) return;
-  auto value = linear;
-  const auto angle = value % angular;
-  value /= angular;
-  const auto phi_index = value % surface_phi;
-  value /= surface_phi;
-  const auto surface = value % surface_radial;
-  const auto row = value / surface_radial;
-  constexpr double two_pi =
-      6.283185307179586476925286766559005768;
-  const double phi =
-      two_pi * (static_cast<double>(phi_index) + 0.5) /
-      static_cast<double>(surface_phi);
-  cuDoubleComplex density = make_cuDoubleComplex(0.0, 0.0);
-  for (std::uint64_t order = 0; order < orders; ++order) {
-    const auto mode =
-        modal_surface[
-            ((row * orders + order) * surface_radial + surface) * angular +
-            angle];
-    const auto basis =
-        make_cuDoubleComplex(cos(order * phi), sin(order * phi));
-    density = cuCadd(density, cuCmul(mode, basis));
-  }
-  egress[linear] = cuCreal(density) * ring_area[surface] /
-                   static_cast<double>(surface_phi);
-}
-
-__global__ void surface_egress_joint_ragged_kernel(
-    const cuDoubleComplex* modal_surface,
-    const std::uint64_t* ring_index, const double* surface_phi_rad,
-    const double* surface_area_mm2, std::uint64_t batch,
-    std::uint64_t orders, std::uint64_t surface_radial,
-    std::uint64_t surface_points, std::uint64_t angular,
-    double* egress) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * surface_points * angular;
-  if (linear >= count) return;
-  const auto angle = linear % angular;
-  const auto point = (linear / angular) % surface_points;
-  const auto row = linear / (surface_points * angular);
-  const auto surface = ring_index[point];
-  const double phi = surface_phi_rad[point];
-  cuDoubleComplex density = make_cuDoubleComplex(0.0, 0.0);
-  for (std::uint64_t order = 0; order < orders; ++order) {
-    const auto mode =
-        modal_surface[
-            ((row * orders + order) * surface_radial + surface) * angular +
-            angle];
-    const auto basis =
-        make_cuDoubleComplex(cos(order * phi), sin(order * phi));
-    density = cuCadd(density, cuCmul(mode, basis));
-  }
-  egress[linear] = cuCreal(density) * surface_area_mm2[point];
-}
-
 __global__ void egress_kernel(
     const double* surface_weight, const double* angular_weight,
     std::uint64_t batch, std::uint64_t surface_count,
@@ -411,56 +256,6 @@ __global__ void egress_adjoint_surface_kernel(
       value * ring_area[surface] / static_cast<double>(surface_phi);
 }
 
-__global__ void egress_adjoint_surface_ragged_kernel(
-    const double* egress_adjoint, const double* angular_weight,
-    const double* surface_area_mm2, std::uint64_t batch,
-    std::uint64_t surface_points, std::uint64_t angular,
-    double* surface_adjoint) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * surface_points;
-  if (linear >= count) return;
-  const auto point = linear % surface_points;
-  const auto row = linear / surface_points;
-  double value = 0.0;
-  for (std::uint64_t angle = 0; angle < angular; ++angle)
-    value += egress_adjoint[
-                 (row * surface_points + point) * angular + angle] *
-             angular_weight[angle];
-  surface_adjoint[linear] = value * surface_area_mm2[point];
-}
-
-__global__ void egress_adjoint_surface_joint_kernel(
-    const double* egress_adjoint, const double* ring_area,
-    std::uint64_t batch, std::uint64_t surface_radial,
-    std::uint64_t surface_phi, std::uint64_t angular,
-    double* surface_adjoint) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * surface_radial * surface_phi * angular;
-  if (linear >= count) return;
-  auto value = linear / angular;
-  value /= surface_phi;
-  const auto surface = value % surface_radial;
-  surface_adjoint[linear] =
-      egress_adjoint[linear] * ring_area[surface] /
-      static_cast<double>(surface_phi);
-}
-
-__global__ void egress_adjoint_surface_joint_ragged_kernel(
-    const double* egress_adjoint, const double* surface_area_mm2,
-    std::uint64_t batch,
-    std::uint64_t surface_points, std::uint64_t angular,
-    double* surface_adjoint) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * surface_points * angular;
-  if (linear >= count) return;
-  const auto point = (linear / angular) % surface_points;
-  surface_adjoint[linear] =
-      egress_adjoint[linear] * surface_area_mm2[point];
-}
-
 __global__ void surface_modes_adjoint_kernel(
     const double* surface_adjoint, std::uint64_t batch,
     std::uint64_t orders, std::uint64_t surface_radial,
@@ -484,98 +279,6 @@ __global__ void surface_modes_adjoint_kernel(
     const double phi =
         two_pi * (static_cast<double>(phi_index) + 0.5) /
         static_cast<double>(surface_phi);
-    real += seed * cos(order * phi);
-    imaginary += seed * sin(order * phi);
-  }
-  output[linear] = make_cuDoubleComplex(real, imaginary);
-}
-
-__global__ void surface_modes_adjoint_ragged_kernel(
-    const double* surface_adjoint,
-    const std::uint64_t* ring_offsets, const double* surface_phi_rad,
-    std::uint64_t batch, std::uint64_t orders,
-    std::uint64_t surface_radial, std::uint64_t surface_points,
-    cuDoubleComplex* output) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * orders * surface_radial;
-  if (linear >= count) return;
-  auto value = linear;
-  const auto surface = value % surface_radial;
-  value /= surface_radial;
-  const auto order = value % orders;
-  const auto row = value / orders;
-  double real = 0.0;
-  double imaginary = 0.0;
-  for (std::uint64_t point = ring_offsets[surface];
-       point < ring_offsets[surface + 1]; ++point) {
-    const double seed = surface_adjoint[row * surface_points + point];
-    const double phi = surface_phi_rad[point];
-    real += seed * cos(order * phi);
-    imaginary += seed * sin(order * phi);
-  }
-  output[linear] = make_cuDoubleComplex(real, imaginary);
-}
-
-__global__ void surface_modes_adjoint_joint_kernel(
-    const double* surface_adjoint, std::uint64_t batch,
-    std::uint64_t orders, std::uint64_t surface_radial,
-    std::uint64_t surface_phi, std::uint64_t angular,
-    cuDoubleComplex* output) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * orders * surface_radial * angular;
-  if (linear >= count) return;
-  auto value = linear;
-  const auto angle = value % angular;
-  value /= angular;
-  const auto surface = value % surface_radial;
-  value /= surface_radial;
-  const auto order = value % orders;
-  const auto row = value / orders;
-  constexpr double two_pi =
-      6.283185307179586476925286766559005768;
-  double real = 0.0;
-  double imaginary = 0.0;
-  for (std::uint64_t phi_index = 0; phi_index < surface_phi; ++phi_index) {
-    const auto surface_index = surface * surface_phi + phi_index;
-    const double seed =
-        surface_adjoint[
-            (row * surface_radial * surface_phi + surface_index) * angular +
-            angle];
-    const double phi =
-        two_pi * (static_cast<double>(phi_index) + 0.5) /
-        static_cast<double>(surface_phi);
-    real += seed * cos(order * phi);
-    imaginary += seed * sin(order * phi);
-  }
-  output[linear] = make_cuDoubleComplex(real, imaginary);
-}
-
-__global__ void surface_modes_adjoint_joint_ragged_kernel(
-    const double* surface_adjoint,
-    const std::uint64_t* ring_offsets, const double* surface_phi_rad,
-    std::uint64_t batch, std::uint64_t orders,
-    std::uint64_t surface_radial, std::uint64_t surface_points,
-    std::uint64_t angular, cuDoubleComplex* output) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * orders * surface_radial * angular;
-  if (linear >= count) return;
-  auto value = linear;
-  const auto angle = value % angular;
-  value /= angular;
-  const auto surface = value % surface_radial;
-  value /= surface_radial;
-  const auto order = value % orders;
-  const auto row = value / orders;
-  double real = 0.0;
-  double imaginary = 0.0;
-  for (std::uint64_t point = ring_offsets[surface];
-       point < ring_offsets[surface + 1]; ++point) {
-    const double seed =
-        surface_adjoint[(row * surface_points + point) * angular + angle];
-    const double phi = surface_phi_rad[point];
     real += seed * cos(order * phi);
     imaginary += seed * sin(order * phi);
   }
@@ -613,45 +316,6 @@ __global__ void phase_modes_adjoint_kernel(
                surface_modes[(row * orders + order) * surface_radial +
                              surface]));
   }
-  output[linear] = result;
-}
-
-__global__ void phase_modes_adjoint_joint_kernel(
-    const cuDoubleComplex* surface_modes,
-    const cuDoubleComplex* coefficients, std::uint64_t batch,
-    std::uint64_t nr, std::uint64_t nm, std::uint64_t nd,
-    std::uint64_t orders, std::uint64_t surface_radial,
-    std::uint64_t angular, cuDoubleComplex* output) {
-  const auto linear =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const auto count = batch * nr * nm * nd * orders;
-  if (linear >= count) return;
-  auto value = linear;
-  const auto order = value % orders;
-  value /= orders;
-  const auto direction_phi = value % nd;
-  value /= nd;
-  const auto mu = value % nm;
-  value /= nm;
-  const auto radial = value % nr;
-  const auto row = value / nr;
-  cuDoubleComplex result = make_cuDoubleComplex(0.0, 0.0);
-  for (std::uint64_t surface = 0; surface < surface_radial; ++surface)
-    for (std::uint64_t angle = 0; angle < angular; ++angle) {
-      const auto coefficient_index =
-          (((((direction_phi * nr + radial) * nm + mu) * orders + order) *
-                 surface_radial +
-             surface) *
-                angular +
-            angle);
-      const auto surface_mode_index =
-          ((row * orders + order) * surface_radial + surface) * angular +
-          angle;
-      result = cuCadd(
-          result,
-          cuCmul(coefficients[coefficient_index],
-                 surface_modes[surface_mode_index]));
-    }
   output[linear] = result;
 }
 
@@ -708,73 +372,33 @@ int prepare_lxe_function_cuda(LXeFunctionInstance* function,
     coefficient[index] =
         make_cuDoubleComplex(function->coefficients[index].real(),
                             function->coefficients[index].imag());
-  bool ready =
-      okay(cudaMalloc(&state->coefficients,
-                      coefficient.size() * sizeof(cuDoubleComplex))) &&
-      okay(cudaMalloc(&state->expected_return,
-                      function->expected_return.size() * sizeof(double))) &&
-      okay(cudaMalloc(&state->angular_weight,
-                      function->angular_weight.size() * sizeof(double)));
-  if (ready && function->ragged_surface) {
-    ready =
-        okay(cudaMalloc(&state->surface_ring_offsets,
-                        function->surface_ring_offsets.size() *
-                            sizeof(std::uint64_t))) &&
-        okay(cudaMalloc(&state->surface_ring_index,
-                        function->surface_ring_index.size() *
-                            sizeof(std::uint64_t))) &&
-        okay(cudaMalloc(&state->surface_phi_rad,
-                        function->surface_phi_rad.size() * sizeof(double))) &&
-        okay(cudaMalloc(&state->surface_area_mm2,
-                        function->surface_area_mm2.size() * sizeof(double)));
-  } else if (ready) {
-    ready = okay(cudaMalloc(
-        &state->surface_ring_area,
-        function->surface_ring_area.size() * sizeof(double)));
-  }
-  if (ready) {
-    ready =
-        okay(cudaMemcpy(state->coefficients, coefficient.data(),
-                        coefficient.size() * sizeof(cuDoubleComplex),
-                        cudaMemcpyHostToDevice)) &&
-        okay(cudaMemcpy(state->expected_return,
-                        function->expected_return.data(),
-                        function->expected_return.size() * sizeof(double),
-                        cudaMemcpyHostToDevice)) &&
-        okay(cudaMemcpy(state->angular_weight,
-                        function->angular_weight.data(),
-                        function->angular_weight.size() * sizeof(double),
-                        cudaMemcpyHostToDevice));
-  }
-  if (ready && function->ragged_surface) {
-    ready =
-        okay(cudaMemcpy(state->surface_ring_offsets,
-                        function->surface_ring_offsets.data(),
-                        function->surface_ring_offsets.size() *
-                            sizeof(std::uint64_t),
-                        cudaMemcpyHostToDevice)) &&
-        okay(cudaMemcpy(state->surface_ring_index,
-                        function->surface_ring_index.data(),
-                        function->surface_ring_index.size() *
-                            sizeof(std::uint64_t),
-                        cudaMemcpyHostToDevice)) &&
-        okay(cudaMemcpy(state->surface_phi_rad,
-                        function->surface_phi_rad.data(),
-                        function->surface_phi_rad.size() * sizeof(double),
-                        cudaMemcpyHostToDevice)) &&
-        okay(cudaMemcpy(state->surface_area_mm2,
-                        function->surface_area_mm2.data(),
-                        function->surface_area_mm2.size() * sizeof(double),
-                        cudaMemcpyHostToDevice));
-  } else if (ready) {
-    ready = okay(cudaMemcpy(state->surface_ring_area,
-                            function->surface_ring_area.data(),
-                            function->surface_ring_area.size() *
-                                sizeof(double),
-                            cudaMemcpyHostToDevice));
-  }
-  if (!ready) {
-    release_constants(*state);
+  if (!okay(cudaMalloc(&state->coefficients,
+                       coefficient.size() * sizeof(cuDoubleComplex))) ||
+      !okay(cudaMalloc(&state->expected_return,
+                       function->expected_return.size() * sizeof(double))) ||
+      !okay(cudaMalloc(&state->surface_ring_area,
+                       function->surface_ring_area.size() * sizeof(double))) ||
+      !okay(cudaMalloc(&state->angular_weight,
+                       function->angular_weight.size() * sizeof(double))) ||
+      !okay(cudaMemcpy(state->coefficients, coefficient.data(),
+                       coefficient.size() * sizeof(cuDoubleComplex),
+                       cudaMemcpyHostToDevice)) ||
+      !okay(cudaMemcpy(state->expected_return,
+                       function->expected_return.data(),
+                       function->expected_return.size() * sizeof(double),
+                       cudaMemcpyHostToDevice)) ||
+      !okay(cudaMemcpy(state->surface_ring_area,
+                       function->surface_ring_area.data(),
+                       function->surface_ring_area.size() * sizeof(double),
+                       cudaMemcpyHostToDevice)) ||
+      !okay(cudaMemcpy(state->angular_weight,
+                       function->angular_weight.data(),
+                       function->angular_weight.size() * sizeof(double),
+                       cudaMemcpyHostToDevice))) {
+    cudaFree(state->coefficients);
+    cudaFree(state->expected_return);
+    cudaFree(state->surface_ring_area);
+    cudaFree(state->angular_weight);
     delete state;
     return 3;
   }
@@ -800,9 +424,9 @@ int apply_lxe_function_cuda(
       batch * function->nr * function->nm * function->nd *
       function->orders;
   const auto modal_count =
-      batch * function->orders * function->surface_radial *
-      (function->joint_angular ? function->angular : 1);
-  const auto surface_count = function->surface_points;
+      batch * function->orders * function->surface_radial;
+  const auto surface_count =
+      function->surface_radial * function->surface_phi;
   const auto egress_count = surface_count * function->angular;
   if (!okay(cudaMemsetAsync(device_retained, 0,
                             batch * states * sizeof(double), stream)) ||
@@ -815,68 +439,31 @@ int apply_lxe_function_cuda(
       threads, 0, stream>>>(
       device_input, batch, function->nr, function->np, function->nm,
       function->nd, function->orders, state.phase_modes);
-  if (function->joint_angular) {
-    modal_surface_joint_kernel<<<
-        static_cast<unsigned int>((modal_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.phase_modes, state.coefficients, batch, function->nr,
-        function->nm, function->nd, function->orders,
-        function->surface_radial, function->angular, state.modal_surface);
-  } else {
-    modal_surface_kernel<<<
-        static_cast<unsigned int>((modal_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.phase_modes, state.coefficients, batch, function->nr,
-        function->nm, function->nd, function->orders,
-        function->surface_radial, state.modal_surface);
-  }
+  modal_surface_kernel<<<
+      static_cast<unsigned int>((modal_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.phase_modes, state.coefficients, batch, function->nr,
+      function->nm, function->nd, function->orders,
+      function->surface_radial, state.modal_surface);
   input_totals_kernel<<<static_cast<unsigned int>(batch), threads, 0,
                         stream>>>(
       device_input, state.expected_return, batch, function->nr,
       function->np, function->nm, function->nd, state.input_total,
       state.expected_total);
-  if (function->joint_angular && function->ragged_surface) {
-    surface_egress_joint_ragged_kernel<<<
-        static_cast<unsigned int>(
-            (batch * egress_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.modal_surface, state.surface_ring_index,
-        state.surface_phi_rad, state.surface_area_mm2, batch,
-        function->orders, function->surface_radial, surface_count,
-        function->angular, device_egress);
-  } else if (function->joint_angular) {
-    surface_egress_joint_kernel<<<
-        static_cast<unsigned int>(
-            (batch * egress_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.modal_surface, state.surface_ring_area, batch,
-        function->orders, function->surface_radial, function->surface_phi,
-        function->angular, device_egress);
-  } else if (function->ragged_surface) {
-    surface_weights_ragged_kernel<<<
-        static_cast<unsigned int>(
-            (batch * surface_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.modal_surface, state.surface_ring_index,
-        state.surface_phi_rad, state.surface_area_mm2, batch,
-        function->orders, function->surface_radial, surface_count,
-        state.surface_weight);
-  } else {
-    surface_weights_kernel<<<
-        static_cast<unsigned int>(
-            (batch * surface_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.modal_surface, state.surface_ring_area, batch,
-        function->orders, function->surface_radial, function->surface_phi,
-        state.surface_weight);
-  }
-  if (!function->joint_angular)
-    egress_kernel<<<
-        static_cast<unsigned int>(
-            (batch * egress_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.surface_weight, state.angular_weight, batch, surface_count,
-        function->angular, device_egress);
+  surface_weights_kernel<<<
+      static_cast<unsigned int>(
+          (batch * surface_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.modal_surface, state.surface_ring_area, batch, function->orders,
+      function->surface_radial, function->surface_phi,
+      state.surface_weight);
+  egress_kernel<<<
+      static_cast<unsigned int>(
+          (batch * egress_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.surface_weight, state.angular_weight, batch, surface_count,
+      function->angular,
+      device_egress);
   losses_kernel<<<static_cast<unsigned int>((batch + threads - 1) / threads),
                   threads, 0, stream>>>(
       state.input_total, state.expected_total, batch, device_losses);
@@ -905,85 +492,29 @@ int apply_lxe_function_adjoint_cuda(
       batch * function->nr * function->nm * function->nd *
       function->orders;
   const auto modal_count =
-      batch * function->orders * function->surface_radial *
-      (function->joint_angular ? function->angular : 1);
-  const auto surface_count = function->surface_points;
-  const auto joint_surface_count =
-      batch * surface_count * function->angular;
+      batch * function->orders * function->surface_radial;
+  const auto surface_count =
+      function->surface_radial * function->surface_phi;
   constexpr int threads = 256;
-  if (function->joint_angular && function->ragged_surface) {
-    egress_adjoint_surface_joint_ragged_kernel<<<
-        static_cast<unsigned int>(
-            (joint_surface_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        device_egress_adjoint, state.surface_area_mm2, batch, surface_count,
-        function->angular,
-        state.surface_weight);
-    surface_modes_adjoint_joint_ragged_kernel<<<
-        static_cast<unsigned int>((modal_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.surface_weight, state.surface_ring_offsets,
-        state.surface_phi_rad, batch, function->orders,
-        function->surface_radial, surface_count, function->angular,
-        state.modal_surface);
-  } else if (function->joint_angular) {
-    egress_adjoint_surface_joint_kernel<<<
-        static_cast<unsigned int>(
-            (joint_surface_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        device_egress_adjoint, state.surface_ring_area, batch,
-        function->surface_radial, function->surface_phi,
-        function->angular, state.surface_weight);
-    surface_modes_adjoint_joint_kernel<<<
-        static_cast<unsigned int>((modal_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.surface_weight, batch, function->orders,
-        function->surface_radial, function->surface_phi,
-        function->angular, state.modal_surface);
-  } else if (function->ragged_surface) {
-    egress_adjoint_surface_ragged_kernel<<<
-        static_cast<unsigned int>(
-            (batch * surface_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        device_egress_adjoint, state.angular_weight,
-        state.surface_area_mm2, batch, surface_count, function->angular,
-        state.surface_weight);
-    surface_modes_adjoint_ragged_kernel<<<
-        static_cast<unsigned int>((modal_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.surface_weight, state.surface_ring_offsets,
-        state.surface_phi_rad, batch, function->orders,
-        function->surface_radial, surface_count, state.modal_surface);
-  } else {
-    egress_adjoint_surface_kernel<<<
-        static_cast<unsigned int>(
-            (batch * surface_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        device_egress_adjoint, state.angular_weight,
-        state.surface_ring_area, batch, function->surface_radial,
-        function->surface_phi, function->angular, state.surface_weight);
-    surface_modes_adjoint_kernel<<<
-        static_cast<unsigned int>((modal_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.surface_weight, batch, function->orders,
-        function->surface_radial, function->surface_phi,
-        state.modal_surface);
-  }
-  if (function->joint_angular) {
-    phase_modes_adjoint_joint_kernel<<<
-        static_cast<unsigned int>((phase_mode_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.modal_surface, state.coefficients, batch, function->nr,
-        function->nm, function->nd, function->orders,
-        function->surface_radial, function->angular, state.phase_modes);
-  } else {
-    phase_modes_adjoint_kernel<<<
-        static_cast<unsigned int>((phase_mode_count + threads - 1) / threads),
-        threads, 0, stream>>>(
-        state.modal_surface, state.coefficients, batch, function->nr,
-        function->nm, function->nd, function->orders,
-        function->surface_radial, state.phase_modes);
-  }
+  egress_adjoint_surface_kernel<<<
+      static_cast<unsigned int>(
+          (batch * surface_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      device_egress_adjoint, state.angular_weight,
+      state.surface_ring_area, batch, function->surface_radial,
+      function->surface_phi, function->angular, state.surface_weight);
+  surface_modes_adjoint_kernel<<<
+      static_cast<unsigned int>((modal_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.surface_weight, batch, function->orders,
+      function->surface_radial, function->surface_phi,
+      state.modal_surface);
+  phase_modes_adjoint_kernel<<<
+      static_cast<unsigned int>((phase_mode_count + threads - 1) / threads),
+      threads, 0, stream>>>(
+      state.modal_surface, state.coefficients, batch, function->nr,
+      function->nm, function->nd, function->orders,
+      function->surface_radial, state.phase_modes);
   input_adjoint_kernel<<<
       static_cast<unsigned int>((batch * states + threads - 1) / threads),
       threads, 0, stream>>>(
@@ -998,7 +529,10 @@ void destroy_lxe_function_cuda(LXeFunctionInstance* function) {
   auto* state = static_cast<CudaState*>(function->cuda_state);
   cudaSetDevice(state->device);
   release_scratch(*state);
-  release_constants(*state);
+  cudaFree(state->coefficients);
+  cudaFree(state->expected_return);
+  cudaFree(state->surface_ring_area);
+  cudaFree(state->angular_weight);
   delete state;
   function->cuda_state = nullptr;
 }

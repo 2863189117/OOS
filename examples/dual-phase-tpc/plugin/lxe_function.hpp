@@ -14,17 +14,10 @@ struct LXeFunctionInstance {
   std::uint64_t orders{};
   std::uint64_t surface_radial{};
   std::uint64_t surface_phi{};
-  std::uint64_t surface_points{};
   std::uint64_t angular{};
-  bool ragged_surface{};
-  bool joint_angular{};
   std::vector<std::complex<double>> coefficients;
   std::vector<double> expected_return;
   std::vector<double> surface_ring_area;
-  std::vector<std::uint64_t> surface_ring_offsets;
-  std::vector<std::uint64_t> surface_ring_index;
-  std::vector<double> surface_phi_rad;
-  std::vector<double> surface_area_mm2;
   std::vector<double> angular_weight;
   void* cuda_state{};
 };

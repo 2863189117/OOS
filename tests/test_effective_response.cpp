@@ -72,42 +72,6 @@ TEST_CASE("bounded effective response matches the direct Neumann cycles") {
   REQUIRE(effective.construction_method == "adjoint_linear");
 }
 
-TEST_CASE("automatic adjoint response converges the all-state remainder") {
-  oos::OperatorSet operators;
-  operators.transition = {1, 1, {0, 1}, {0}, {0.5}};
-  operators.detection = {1, 1, {0, 1}, {0}, {0.2}};
-  operators.losses = {1, 1, {0, 1}, {0}, {0.3}};
-  operators.channel_ids = {17};
-  operators.loss_names = {"absorption"};
-  operators.cache_key_sha256 = "automatic-operator-key";
-  operators.code_commit = "commit";
-  operators.tolerance = 0.13;
-  operators.maximum_iterations = 16;
-
-  const auto effective =
-      oos::build_effective_response_cpu(operators, 0, 1);
-  REQUIRE(effective.cycles == 3);
-  REQUIRE(effective.state_unresolved[0] ==
-          Catch::Approx(0.125).margin(1.0e-14));
-
-  oos::SourceBatch source{1, {0.8}, {0.1}, {0.05}};
-  const auto materialized =
-      oos::apply_effective_response_cpu(effective, source);
-  const auto direct = oos::Solver::solve_cpu(operators, source);
-  REQUIRE(materialized.iterations == direct.iterations);
-  REQUIRE(materialized.efficiency[0] ==
-          Catch::Approx(direct.efficiency[0]).margin(1.0e-14));
-  REQUIRE(materialized.losses[0] ==
-          Catch::Approx(direct.losses[0]).margin(1.0e-14));
-  REQUIRE(materialized.unresolved[0] ==
-          Catch::Approx(direct.unresolved[0]).margin(1.0e-14));
-
-  operators.tolerance = 0.1;
-  operators.maximum_iterations = 3;
-  REQUIRE_THROWS_AS(oos::build_effective_response_cpu(operators, 0, 1),
-                    std::runtime_error);
-}
-
 TEST_CASE("adjoint precompute composes multiple function blocks") {
   oos::OperatorSet operators;
   operators.transition = csr(4, 4, {0, 0, 0, 0, 0}, {}, {});
