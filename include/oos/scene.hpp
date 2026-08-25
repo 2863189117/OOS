@@ -133,8 +133,8 @@ struct Numerics {
   double ray_origin_offset_mm{0.0};
   double energy_tolerance{1e-10};
   double neumann_tolerance{1e-10};
-  std::uint32_t lambertian_mu2_order{8};
-  std::uint32_t lambertian_phi_count{48};
+  std::uint32_t lambertian_mu2_order{12};
+  std::uint32_t lambertian_phi_count{72};
   std::uint32_t maximum_specular_hits{64};
   std::uint32_t maximum_diffuse_bounces{256};
 };
