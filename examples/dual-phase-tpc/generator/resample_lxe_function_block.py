@@ -296,7 +296,7 @@ def _geometry_ragged_surface(
                         identity.get("legacy_discretization", {}),
                     )
                 )
-                # The archived XLZD builder stores the legacy controls in a
+                # The archived legacy builder stores these controls in a
                 # nested object but keeps the newer LXe-egress controls at the
                 # identity root.  Preserve both layouts in derived metadata.
                 for name in (
