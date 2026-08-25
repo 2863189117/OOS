@@ -6,8 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
-#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <type_traits>
@@ -760,133 +758,12 @@ void save_response_hdf5(const std::filesystem::path& path,
                         const SolveResult& result,
                         const OperatorSet& operators,
                         std::uint64_t source_count) {
-  if (operators.detection.cols != 0 &&
-      source_count > std::numeric_limits<std::size_t>::max() /
-                         operators.detection.cols)
-    throw std::runtime_error("response PMT-probability shape overflows");
-  const auto expected_efficiency = source_count * operators.detection.cols;
-  if (result.efficiency.size() != expected_efficiency)
-    throw std::runtime_error("response PMT-probability shape mismatch");
-  std::vector<double> certified_efficiency = result.efficiency;
-  std::vector<double> minimum_channel_efficiency(
-      source_count,
-      operators.detection.cols == 0
-          ? 0.0
-          : std::numeric_limits<double>::infinity());
-  std::vector<double> raw_minimum_channel_efficiency =
-      minimum_channel_efficiency;
-  std::vector<std::uint64_t> projected_negative_channel_count(source_count, 0);
-  std::vector<double> projected_negative_efficiency_mass(source_count, 0.0);
-  std::vector<double> projection_conditional_tv(source_count, 0.0);
-  std::vector<std::uint8_t> projection_applied(source_count, 0);
-  std::vector<double> raw_detected_efficiency(source_count, 0.0);
-  std::vector<double> projected_detected_efficiency(source_count, 0.0);
-  std::vector<double> projection_mass_error(source_count, 0.0);
-  for (std::uint64_t source = 0; source < source_count; ++source) {
-    const auto offset = source * operators.detection.cols;
-    double positive_mass = 0.0;
-    double negative_mass = 0.0;
-    std::uint64_t largest_channel = 0;
-    for (std::uint64_t channel = 0; channel < operators.detection.cols;
-         ++channel) {
-      const auto index = offset + channel;
-      const double value = result.efficiency[index];
-      if (!std::isfinite(value))
-        throw std::runtime_error(
-            "final PMT probability is non-finite at source " +
-            std::to_string(source) + ", channel " + std::to_string(channel));
-      raw_minimum_channel_efficiency[source] =
-          std::min(raw_minimum_channel_efficiency[source], value);
-      if (value < 0.0) {
-        negative_mass -= value;
-        if (!std::isfinite(negative_mass))
-          throw std::runtime_error(
-              "final PMT negative mass is non-finite at source " +
-              std::to_string(source));
-        ++projected_negative_channel_count[source];
-      } else {
-        positive_mass += value;
-        if (!std::isfinite(positive_mass))
-          throw std::runtime_error(
-              "final PMT positive mass is non-finite at source " +
-              std::to_string(source));
-        if (value > result.efficiency[offset + largest_channel])
-          largest_channel = channel;
-      }
-    }
-    const double total = positive_mass - negative_mass;
-    if (!std::isfinite(total))
-      throw std::runtime_error(
-          "final PMT detected mass is non-finite at source " +
-          std::to_string(source));
-    raw_detected_efficiency[source] = total;
-    if (negative_mass == 0.0) {
-      minimum_channel_efficiency[source] =
-          raw_minimum_channel_efficiency[source];
-      projected_detected_efficiency[source] = total;
-      continue;
-    }
-    if (!(positive_mass > 0.0) || !(negative_mass > 0.0) || !(total > 0.0))
-      throw std::runtime_error(
-          "final PMT vector cannot be projected to a nonnegative vector "
-          "with its detected mass preserved at source " +
-          std::to_string(source));
-    const double scale = total / positive_mass;
-    if (!std::isfinite(scale) || scale < 0.0 || !(scale < 1.0))
-      throw std::runtime_error(
-          "final PMT nonnegative-projection scale is invalid at source " +
-          std::to_string(source));
-    for (std::uint64_t channel = 0; channel < operators.detection.cols;
-         ++channel) {
-      const auto index = offset + channel;
-      certified_efficiency[index] =
-          result.efficiency[index] > 0.0
-              ? result.efficiency[index] * scale
-              : 0.0;
-    }
-    // Restore the original detected mass independently of summation order.
-    const double projected_total = std::accumulate(
-        certified_efficiency.begin() + offset,
-        certified_efficiency.begin() + offset + operators.detection.cols,
-        0.0);
-    if (!std::isfinite(projected_total))
-      throw std::runtime_error(
-          "nonnegative PMT projection produced non-finite detected mass");
-    certified_efficiency[offset + largest_channel] += total - projected_total;
-    for (std::uint64_t channel = 0; channel < operators.detection.cols;
-         ++channel) {
-      const double value = certified_efficiency[offset + channel];
-      if (!std::isfinite(value) || value < 0.0)
-        throw std::runtime_error(
-            "nonnegative PMT projection lost numerical positivity");
-    }
-    const double corrected_total = std::accumulate(
-        certified_efficiency.begin() + offset,
-        certified_efficiency.begin() + offset + operators.detection.cols,
-        0.0);
-    const double mass_error = corrected_total - total;
-    const double mass_tolerance =
-        16.0 * std::max<std::uint64_t>(operators.detection.cols, 1) *
-        std::numeric_limits<double>::epsilon() * std::abs(total);
-    if (!std::isfinite(corrected_total) ||
-        std::abs(mass_error) > mass_tolerance)
-      throw std::runtime_error(
-          "nonnegative PMT projection did not preserve detected mass");
-    minimum_channel_efficiency[source] = *std::min_element(
-        certified_efficiency.begin() + offset,
-        certified_efficiency.begin() + offset + operators.detection.cols);
-    projection_applied[source] = 1;
-    projected_negative_efficiency_mass[source] = negative_mass;
-    projection_conditional_tv[source] = negative_mass / total;
-    projected_detected_efficiency[source] = corrected_total;
-    projection_mass_error[source] = mass_error;
-  }
   H5Handle file(H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT),
                 H5Fclose);
   H5Handle group(H5Gcreate2(file, "/response", H5P_DEFAULT, H5P_DEFAULT,
                             H5P_DEFAULT),
                  H5Gclose);
-  write_dataset(file, "/response/efficiency", certified_efficiency,
+  write_dataset(file, "/response/efficiency", result.efficiency,
                 {source_count, operators.detection.cols});
   write_dataset(file, "/response/losses", result.losses,
                 {source_count, operators.losses.cols});
@@ -894,29 +771,6 @@ void save_response_hdf5(const std::filesystem::path& path,
                 {source_count});
   write_dataset(file, "/response/input_weight", result.input_weight,
                 {source_count});
-  write_dataset(file, "/response/minimum_channel_efficiency",
-                minimum_channel_efficiency, {source_count});
-  write_dataset(file, "/response/raw_minimum_channel_efficiency",
-                raw_minimum_channel_efficiency, {source_count});
-  write_dataset(file, "/response/projected_negative_channel_count",
-                projected_negative_channel_count, {source_count});
-  write_dataset(file, "/response/projected_negative_efficiency_mass",
-                projected_negative_efficiency_mass, {source_count});
-  write_dataset(file, "/response/nonnegative_projection_conditional_tv",
-                projection_conditional_tv, {source_count});
-  write_dataset(file, "/response/nonnegative_projection_applied",
-                projection_applied, {source_count});
-  write_dataset(file, "/response/raw_detected_efficiency",
-                raw_detected_efficiency, {source_count});
-  write_dataset(file, "/response/projected_detected_efficiency",
-                projected_detected_efficiency, {source_count});
-  write_dataset(file, "/response/nonnegative_projection_mass_error",
-                projection_mass_error, {source_count});
-  write_string(
-      file, "/response/nonnegative_projection_method",
-      "clip_negative_scale_positive_preserve_detected_mass_v1");
-  write_dataset(file, "/response/nonnegative_pmt_probability_certified",
-                std::vector<std::uint8_t>{1}, {1});
   if (result.source_integration_l1_error_estimate.size() != source_count)
     throw std::runtime_error(
         "source integration error-estimate shape mismatch");
@@ -933,7 +787,7 @@ void save_response_hdf5(const std::filesystem::path& path,
     for (std::uint64_t channel = 0; channel < operators.detection.cols;
          ++channel)
       terminal +=
-          certified_efficiency[source * operators.detection.cols + channel];
+          result.efficiency[source * operators.detection.cols + channel];
     for (std::uint64_t loss = 0; loss < operators.losses.cols; ++loss)
       terminal += result.losses[source * operators.losses.cols + loss];
     closure[source] = result.input_weight[source] - terminal;

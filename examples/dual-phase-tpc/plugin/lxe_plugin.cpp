@@ -125,41 +125,27 @@ LXeFunctionInstance load_function_instance(const std::string& path) {
         read<double>(file, "/function/coefficients_imag");
     const auto [expected, expected_shape] =
         read<double>(file, "/function/expected_return");
+    const auto [ring_area, ring_shape] =
+        read<double>(file, "/function/surface_ring_area_mm2");
     const auto [angular, angular_shape] =
         read<double>(file, "/function/angular_weight");
     const auto metadata =
         nlohmann::json::parse(read_string(file, "/metadata/generator_json"));
     const auto phase =
         nlohmann::json::parse(read_string(file, "/metadata/phase_grid_json"));
-    const bool joint_angular = coefficient_shape.size() == 6;
-    if ((coefficient_shape.size() != 5 && !joint_angular) ||
+    if (coefficient_shape.size() != 5 ||
         coefficient_shape != imaginary_shape ||
         real.size() != imaginary.size() ||
         expected_shape !=
             std::vector<std::uint64_t>{coefficient_shape[0],
                                        coefficient_shape[1],
                                        coefficient_shape[2]} ||
+        ring_shape !=
+            std::vector<std::uint64_t>{coefficient_shape[4]} ||
         angular_shape.size() != 1 ||
-        (joint_angular && coefficient_shape[5] != angular.size()))
+        metadata.value("schema", std::string{}) !=
+            "oos.nonlocal.function.v1")
       throw std::runtime_error("LXe function block has inconsistent shapes");
-    if (!std::all_of(real.begin(), real.end(),
-                     [](double value) { return std::isfinite(value); }) ||
-        !std::all_of(imaginary.begin(), imaginary.end(),
-                     [](double value) { return std::isfinite(value); }) ||
-        !std::all_of(expected.begin(), expected.end(), [](double value) {
-          return std::isfinite(value) && value >= -1.0e-12 && value < 1.0;
-        }) ||
-        !std::all_of(angular.begin(), angular.end(), [](double value) {
-          return std::isfinite(value) && value >= 0.0;
-        }) ||
-        std::abs(std::accumulate(angular.begin(), angular.end(), 0.0) - 1.0) >
-            1.0e-12)
-      throw std::runtime_error(
-          "LXe coefficients, expected return, or angular weights are invalid");
-    const auto schema = metadata.value("schema", std::string{});
-    if (schema != "oos.nonlocal.function.v1" &&
-        schema != "oos.nonlocal.function.v2")
-      throw std::runtime_error("unsupported LXe function block schema");
     LXeFunctionInstance result;
     result.nd = coefficient_shape[0];
     result.nr = coefficient_shape[1];
@@ -167,145 +153,20 @@ LXeFunctionInstance load_function_instance(const std::string& path) {
     result.orders = coefficient_shape[3];
     result.surface_radial = coefficient_shape[4];
     result.np = phase.at("position_phi_bins").get<std::uint64_t>();
+    result.surface_phi =
+        metadata.at("surface_phi_bins").get<std::uint64_t>();
     result.angular = angular.size();
-    result.joint_angular = joint_angular;
     if (phase.at("position_radial_bins").get<std::uint64_t>() != result.nr ||
         phase.at("direction_mu_bins").get<std::uint64_t>() != result.nm ||
         phase.at("direction_phi_bins").get<std::uint64_t>() != result.nd ||
         metadata.at("angular_count").get<std::uint64_t>() != result.angular)
       throw std::runtime_error(
           "LXe phase metadata does not match factorized arrays");
-    if (joint_angular &&
-        metadata.value("coefficient_layout", std::string{}) !=
-            "joint_surface_angle_v1")
-      throw std::runtime_error(
-          "rank-six LXe coefficients require joint_surface_angle_v1");
-    const auto [ring_area, ring_shape] =
-        read<double>(file, "/function/surface_ring_area_mm2");
-    if (ring_shape !=
-        std::vector<std::uint64_t>{result.surface_radial})
-      throw std::runtime_error(
-          "LXe surface ring areas have inconsistent shape");
-    if (!std::all_of(ring_area.begin(), ring_area.end(), [](double value) {
-          return std::isfinite(value) && value > 0.0;
-        }))
-      throw std::runtime_error("LXe surface ring areas must be finite and positive");
-    result.surface_ring_area = ring_area;
-    if (schema == "oos.nonlocal.function.v1") {
-      result.surface_phi =
-          metadata.at("surface_phi_bins").get<std::uint64_t>();
-      if (result.surface_phi == 0)
-        throw std::runtime_error("LXe v1 surface_phi_bins must be positive");
-      result.surface_points = result.surface_radial * result.surface_phi;
-    } else {
-      if (metadata.value("surface_layout", std::string{}) !=
-          "ragged_ring_v1")
-        throw std::runtime_error(
-            "LXe v2 requires surface_layout=ragged_ring_v1");
-      const auto [offsets, offset_shape] =
-          read<std::uint64_t>(file, "/function/surface_ring_offsets");
-      const auto [surface_phi, surface_phi_shape] =
-          read<double>(file, "/function/surface_phi_rad");
-      const auto [surface_area, surface_area_shape] =
-          read<double>(file, "/function/surface_area_mm2");
-      if (offset_shape !=
-              std::vector<std::uint64_t>{result.surface_radial + 1} ||
-          surface_phi_shape.size() != 1 ||
-          surface_area_shape != surface_phi_shape || offsets.empty() ||
-          offsets.front() != 0 || offsets.back() != surface_phi.size() ||
-          surface_phi.empty())
-        throw std::runtime_error(
-            "LXe v2 ragged surface arrays have inconsistent shapes");
-      for (std::uint64_t surface = 0; surface < result.surface_radial;
-           ++surface)
-        if (offsets[surface] >= offsets[surface + 1])
-          throw std::runtime_error(
-              "LXe v2 surface rings must be nonempty and ordered");
-      constexpr double two_pi =
-          6.283185307179586476925286766559005768;
-      for (std::size_t point = 0; point < surface_phi.size(); ++point)
-        if (!std::isfinite(surface_phi[point]) || surface_phi[point] < 0.0 ||
-            surface_phi[point] >= two_pi ||
-            !std::isfinite(surface_area[point]) ||
-            !(surface_area[point] > 0.0))
-          throw std::runtime_error(
-              "LXe v2 surface quadrature contains invalid values");
-      if (metadata.at("surface_point_count").get<std::uint64_t>() !=
-              surface_phi.size() ||
-          metadata.at("egress_count").get<std::uint64_t>() !=
-              surface_phi.size() * result.angular)
-        throw std::runtime_error(
-            "LXe v2 surface metadata disagrees with its arrays");
-      for (std::uint64_t surface = 0; surface < result.surface_radial;
-           ++surface) {
-        double area_sum = 0.0;
-        for (auto point = offsets[surface]; point < offsets[surface + 1];
-             ++point)
-          area_sum += surface_area[point];
-        const double area_tolerance =
-            5.0e-8 + 2.0e-12 * std::abs(ring_area[surface]);
-        if (std::abs(area_sum - ring_area[surface]) > area_tolerance)
-          throw std::runtime_error(
-              "LXe v2 point areas do not reproduce the modal ring area");
-        for (std::uint64_t order = 1; order < result.orders; ++order) {
-          std::complex<double> moment{0.0, 0.0};
-          for (auto point = offsets[surface]; point < offsets[surface + 1];
-               ++point)
-            moment += surface_area[point] *
-                      std::exp(std::complex<double>{
-                          0.0, static_cast<double>(order) *
-                                   surface_phi[point]});
-          if (std::abs(moment) > area_tolerance)
-            throw std::runtime_error(
-                "LXe v2 surface quadrature aliases a retained Fourier mode");
-        }
-      }
-      for (std::uint64_t direction_phi = 0; direction_phi < result.nd;
-           ++direction_phi)
-        for (std::uint64_t radial = 0; radial < result.nr; ++radial)
-          for (std::uint64_t mu = 0; mu < result.nm; ++mu) {
-            const auto expected_index =
-                (direction_phi * result.nr + radial) * result.nm + mu;
-            double integral = 0.0;
-            for (std::uint64_t surface = 0;
-                 surface < result.surface_radial; ++surface) {
-              const auto coefficient =
-                  ((((direction_phi * result.nr + radial) * result.nm + mu) *
-                         result.orders) *
-                        result.surface_radial +
-                    surface);
-              if (result.joint_angular) {
-                for (std::uint64_t angle = 0; angle < result.angular; ++angle)
-                  integral +=
-                      real[coefficient * result.angular + angle] *
-                      ring_area[surface];
-              } else {
-                integral += real[coefficient] * ring_area[surface];
-              }
-            }
-            const double expected_tolerance =
-                1.0e-12 + 2.0e-12 * std::abs(expected[expected_index]);
-            if (std::abs(integral - expected[expected_index]) >
-                expected_tolerance)
-              throw std::runtime_error(
-                  "LXe v2 m=0 integral disagrees with expected_return");
-          }
-      result.ragged_surface = true;
-      result.surface_points = surface_phi.size();
-      result.surface_ring_offsets = offsets;
-      result.surface_ring_index.resize(result.surface_points);
-      for (std::uint64_t surface = 0; surface < result.surface_radial;
-           ++surface)
-        std::fill(result.surface_ring_index.begin() + offsets[surface],
-                  result.surface_ring_index.begin() + offsets[surface + 1],
-                  surface);
-      result.surface_phi_rad = surface_phi;
-      result.surface_area_mm2 = surface_area;
-    }
     result.coefficients.resize(real.size());
     for (std::size_t index = 0; index < real.size(); ++index)
       result.coefficients[index] = {real[index], imaginary[index]};
     result.expected_return = expected;
+    result.surface_ring_area = ring_area;
     result.angular_weight = angular;
     H5Fclose(file);
     return result;
@@ -612,7 +473,8 @@ int32_t create_function(oos_string_view_v1 config, double,
         std::make_unique<LXeFunctionInstance>(
             load_function_instance(block_path(parsed)));
     const auto states = value->nr * value->np * value->nm * value->nd;
-    const auto egress = value->surface_points * value->angular;
+    const auto egress =
+        value->surface_radial * value->surface_phi * value->angular;
     const double contraction =
         *std::max_element(value->expected_return.begin(),
                           value->expected_return.end());
@@ -645,7 +507,8 @@ int32_t apply_function_cpu(
     const auto& function = *static_cast<LXeFunctionInstance*>(opaque);
     const auto state_count =
         function.nr * function.np * function.nm * function.nd;
-    const auto surface_count = function.surface_points;
+    const auto surface_count =
+        function.surface_radial * function.surface_phi;
     const auto egress_count = surface_count * function.angular;
     std::fill(retained, retained + batch * state_count, 0.0);
     std::fill(egress, egress + batch * egress_count, 0.0);
@@ -656,10 +519,8 @@ int32_t apply_function_cpu(
     for (std::int64_t signed_row = 0;
          signed_row < static_cast<std::int64_t>(batch); ++signed_row) {
       const auto row = static_cast<std::uint64_t>(signed_row);
-      const auto modal_angles = function.joint_angular ? function.angular : 1;
       std::vector<std::complex<double>> modal(
-          function.orders * function.surface_radial * modal_angles,
-          {0.0, 0.0});
+          function.orders * function.surface_radial, {0.0, 0.0});
       double input_weight = 0.0;
       double expected_weight = 0.0;
       for (std::uint64_t radial = 0; radial < function.nr; ++radial)
@@ -701,112 +562,34 @@ int32_t apply_function_cpu(
                       order) *
                          function.surface_radial +
                      surface);
-                if (function.joint_angular) {
-                  for (std::uint64_t angle = 0; angle < function.angular;
-                       ++angle)
-                    modal[(order * function.surface_radial + surface) *
-                              function.angular +
-                          angle] +=
-                        position_modes[order] *
-                        function.coefficients[
-                            coefficient * function.angular + angle];
-                } else {
-                  modal[order * function.surface_radial + surface] +=
-                      position_modes[order] *
-                      function.coefficients[coefficient];
-                }
+                modal[order * function.surface_radial + surface] +=
+                    position_modes[order] *
+                    function.coefficients[coefficient];
               }
           }
-      if (function.joint_angular && !function.ragged_surface) {
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t position_phi = 0;
-               position_phi < function.surface_phi; ++position_phi) {
-            const double phi =
-                two_pi * (static_cast<double>(position_phi) + 0.5) /
-                static_cast<double>(function.surface_phi);
-            const auto surface_index =
-                surface * function.surface_phi + position_phi;
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle) {
-              std::complex<double> density{0.0, 0.0};
-              for (std::uint64_t order = 0; order < function.orders; ++order)
-                density +=
-                    modal[(order * function.surface_radial + surface) *
-                              function.angular +
-                          angle] *
-                    std::exp(std::complex<double>{
-                        0.0, static_cast<double>(order) * phi});
-              egress[row * egress_count +
-                     surface_index * function.angular + angle] =
-                  density.real() * function.surface_ring_area[surface] /
-                  static_cast<double>(function.surface_phi);
-            }
-          }
-      } else if (function.joint_angular) {
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t point =
-                   function.surface_ring_offsets[surface];
-               point < function.surface_ring_offsets[surface + 1]; ++point) {
-            const double phi = function.surface_phi_rad[point];
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle) {
-              std::complex<double> density{0.0, 0.0};
-              for (std::uint64_t order = 0; order < function.orders; ++order)
-                density +=
-                    modal[(order * function.surface_radial + surface) *
-                              function.angular +
-                          angle] *
-                    std::exp(std::complex<double>{
-                        0.0, static_cast<double>(order) * phi});
-              egress[row * egress_count + point * function.angular + angle] =
-                  density.real() * function.surface_area_mm2[point];
-            }
-          }
-      } else if (!function.ragged_surface) {
-        // Keep the v1 arithmetic and traversal order unchanged.
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t position_phi = 0;
-               position_phi < function.surface_phi; ++position_phi) {
-            const double phi =
-                two_pi * (static_cast<double>(position_phi) + 0.5) /
-                static_cast<double>(function.surface_phi);
-            std::complex<double> density{0.0, 0.0};
-            for (std::uint64_t order = 0; order < function.orders; ++order)
-              density +=
-                  modal[order * function.surface_radial + surface] *
-                  std::exp(std::complex<double>{
-                      0.0, static_cast<double>(order) * phi});
-            const double surface_weight =
-                density.real() * function.surface_ring_area[surface] /
-                static_cast<double>(function.surface_phi);
-            const auto surface_index =
-                surface * function.surface_phi + position_phi;
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle)
-              egress[row * egress_count +
-                     surface_index * function.angular + angle] =
-                  surface_weight * function.angular_weight[angle];
-          }
-      } else {
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t point =
-                   function.surface_ring_offsets[surface];
-               point < function.surface_ring_offsets[surface + 1]; ++point) {
-            const double phi = function.surface_phi_rad[point];
-            std::complex<double> density{0.0, 0.0};
-            for (std::uint64_t order = 0; order < function.orders; ++order)
-              density +=
-                  modal[order * function.surface_radial + surface] *
-                  std::exp(std::complex<double>{
-                      0.0, static_cast<double>(order) * phi});
-            const double surface_weight =
-                density.real() * function.surface_area_mm2[point];
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle)
-              egress[row * egress_count + point * function.angular + angle] =
-                  surface_weight * function.angular_weight[angle];
-          }
-      }
+      for (std::uint64_t surface = 0;
+           surface < function.surface_radial; ++surface)
+        for (std::uint64_t position_phi = 0;
+             position_phi < function.surface_phi; ++position_phi) {
+          const double phi =
+              two_pi * (static_cast<double>(position_phi) + 0.5) /
+              static_cast<double>(function.surface_phi);
+          std::complex<double> density{0.0, 0.0};
+          for (std::uint64_t order = 0; order < function.orders; ++order)
+            density +=
+                modal[order * function.surface_radial + surface] *
+                std::exp(std::complex<double>{
+                    0.0, static_cast<double>(order) * phi});
+          const double surface_weight =
+              density.real() * function.surface_ring_area[surface] /
+              static_cast<double>(function.surface_phi);
+          const auto surface_index =
+              surface * function.surface_phi + position_phi;
+          for (std::uint64_t angle = 0; angle < function.angular; ++angle)
+            egress[row * egress_count +
+                   surface_index * function.angular + angle] =
+                surface_weight * function.angular_weight[angle];
+        }
       losses[row] = input_weight - expected_weight;
     }
     return 0;
@@ -824,7 +607,8 @@ int32_t apply_function_adjoint_cpu(
     const auto& function = *static_cast<LXeFunctionInstance*>(opaque);
     const auto state_count =
         function.nr * function.np * function.nm * function.nd;
-    const auto surface_count = function.surface_points;
+    const auto surface_count =
+        function.surface_radial * function.surface_phi;
     const auto egress_count = surface_count * function.angular;
     (void)retained_adjoint;
     std::fill(input_adjoint, input_adjoint + batch * state_count, 0.0);
@@ -834,101 +618,30 @@ int32_t apply_function_adjoint_cpu(
     for (std::int64_t signed_row = 0;
          signed_row < static_cast<std::int64_t>(batch); ++signed_row) {
       const auto row = static_cast<std::uint64_t>(signed_row);
-      const auto modal_angles = function.joint_angular ? function.angular : 1;
       std::vector<std::complex<double>> surface_modes(
-          function.orders * function.surface_radial * modal_angles,
-          {0.0, 0.0});
-      if (function.joint_angular && !function.ragged_surface) {
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t position_phi = 0;
-               position_phi < function.surface_phi; ++position_phi) {
-            const auto surface_index =
-                surface * function.surface_phi + position_phi;
-            const double phi =
-                two_pi * (static_cast<double>(position_phi) + 0.5) /
-                static_cast<double>(function.surface_phi);
-            const double area = function.surface_ring_area[surface] /
-                                static_cast<double>(function.surface_phi);
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle) {
-              const double seed =
-                  egress_adjoint[row * egress_count +
-                                 surface_index * function.angular + angle] *
-                  area;
-              for (std::uint64_t order = 0; order < function.orders; ++order)
-                surface_modes[
-                    (order * function.surface_radial + surface) *
-                        function.angular +
-                    angle] +=
-                    seed * std::exp(std::complex<double>{
-                               0.0, static_cast<double>(order) * phi});
-            }
-          }
-      } else if (function.joint_angular) {
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t point =
-                   function.surface_ring_offsets[surface];
-               point < function.surface_ring_offsets[surface + 1]; ++point) {
-            const double phi = function.surface_phi_rad[point];
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle) {
-              const double seed =
-                  egress_adjoint[row * egress_count +
-                                 point * function.angular + angle] *
-                  function.surface_area_mm2[point];
-              for (std::uint64_t order = 0; order < function.orders; ++order)
-                surface_modes[
-                    (order * function.surface_radial + surface) *
-                        function.angular +
-                    angle] +=
-                    seed * std::exp(std::complex<double>{
-                               0.0, static_cast<double>(order) * phi});
-            }
-          }
-      } else if (!function.ragged_surface) {
-        // Keep the v1 arithmetic and traversal order unchanged.
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t position_phi = 0;
-               position_phi < function.surface_phi; ++position_phi) {
-            const auto surface_index =
-                surface * function.surface_phi + position_phi;
-            double seed = 0.0;
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle)
-              seed += egress_adjoint[
-                          row * egress_count +
-                          surface_index * function.angular + angle] *
-                      function.angular_weight[angle];
-            seed *= function.surface_ring_area[surface] /
-                    static_cast<double>(function.surface_phi);
-            const double phi =
-                two_pi * (static_cast<double>(position_phi) + 0.5) /
-                static_cast<double>(function.surface_phi);
-            for (std::uint64_t order = 0; order < function.orders; ++order)
-              surface_modes[order * function.surface_radial + surface] +=
-                  seed * std::exp(std::complex<double>{
-                             0.0, static_cast<double>(order) * phi});
-          }
-      } else {
-        for (std::uint64_t surface = 0;
-             surface < function.surface_radial; ++surface)
-          for (std::uint64_t point =
-                   function.surface_ring_offsets[surface];
-               point < function.surface_ring_offsets[surface + 1]; ++point) {
-            double seed = 0.0;
-            for (std::uint64_t angle = 0; angle < function.angular; ++angle)
-              seed += egress_adjoint[
-                          row * egress_count + point * function.angular +
-                          angle] *
-                      function.angular_weight[angle];
-            seed *= function.surface_area_mm2[point];
-            const double phi = function.surface_phi_rad[point];
-            for (std::uint64_t order = 0; order < function.orders; ++order)
-              surface_modes[order * function.surface_radial + surface] +=
-                  seed * std::exp(std::complex<double>{
-                             0.0, static_cast<double>(order) * phi});
-          }
-      }
+          function.orders * function.surface_radial, {0.0, 0.0});
+      for (std::uint64_t surface = 0;
+           surface < function.surface_radial; ++surface)
+        for (std::uint64_t position_phi = 0;
+             position_phi < function.surface_phi; ++position_phi) {
+          const auto surface_index =
+              surface * function.surface_phi + position_phi;
+          double seed = 0.0;
+          for (std::uint64_t angle = 0; angle < function.angular; ++angle)
+            seed += egress_adjoint[
+                        row * egress_count +
+                        surface_index * function.angular + angle] *
+                    function.angular_weight[angle];
+          seed *= function.surface_ring_area[surface] /
+                  static_cast<double>(function.surface_phi);
+          const double phi =
+              two_pi * (static_cast<double>(position_phi) + 0.5) /
+              static_cast<double>(function.surface_phi);
+          for (std::uint64_t order = 0; order < function.orders; ++order)
+            surface_modes[order * function.surface_radial + surface] +=
+                seed * std::exp(std::complex<double>{
+                           0.0, static_cast<double>(order) * phi});
+        }
       for (std::uint64_t radial = 0; radial < function.nr; ++radial)
         for (std::uint64_t mu = 0; mu < function.nm; ++mu)
           for (std::uint64_t direction_phi = 0;
@@ -948,22 +661,9 @@ int32_t apply_function_adjoint_cpu(
                       order) *
                          function.surface_radial +
                      surface);
-                if (function.joint_angular) {
-                  for (std::uint64_t angle = 0; angle < function.angular;
-                       ++angle)
-                    phase_adjoint[order] +=
-                        function.coefficients[
-                            coefficient * function.angular + angle] *
-                        surface_modes[
-                            (order * function.surface_radial + surface) *
-                                function.angular +
-                            angle];
-                } else {
-                  phase_adjoint[order] +=
-                      function.coefficients[coefficient] *
-                      surface_modes[
-                          order * function.surface_radial + surface];
-                }
+                phase_adjoint[order] +=
+                    function.coefficients[coefficient] *
+                    surface_modes[order * function.surface_radial + surface];
               }
             for (std::uint64_t position_phi = 0;
                  position_phi < function.np; ++position_phi) {
@@ -1037,7 +737,7 @@ const oos_surface_plugin_v3 plugin{
 const oos_function_operator_v2 function_operator{
     OOS_FUNCTION_OPERATOR_ABI_V2,
     {"oos_lxe_factorized", 18},
-    {"0.6.0", 5},
+    {"0.5.0", 5},
     validate_function,
     create_function,
     destroy_function,

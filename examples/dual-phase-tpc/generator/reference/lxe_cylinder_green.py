@@ -23,9 +23,9 @@ from scipy import optimize, special
 
 from .lxe_diffusion_return import (
     LXeDiffusionConfig,
-    configured_top_extrapolation_length_mm,
     diffuse_fresnel_reflection_moments,
     extrapolation_length_mm,
+    fresnel_extrapolation_length_mm,
 )
 
 
@@ -179,8 +179,8 @@ class LXeCylinderGreen:
         self.top_fresnel_second_moment = top_second_moment
         self.top_escape_fraction = 1.0 - top_first_moment
         self.top_reflectivity = top_first_moment
-        self.top_extrapolation_length_mm = configured_top_extrapolation_length_mm(
-            config
+        self.top_extrapolation_length_mm = fresnel_extrapolation_length_mm(
+            diffusion, config.n_lxe, config.n_gxe
         )
         self.beta_top = diffusion / self.top_extrapolation_length_mm
         self.beta_side = self._boundary_coefficient(config.side_reflectivity)
@@ -196,7 +196,7 @@ class LXeCylinderGreen:
             return 0.0
         return diffusion / length
 
-    def top_boundary_audit(self) -> dict[str, float | str]:
+    def top_boundary_audit(self) -> dict[str, float]:
         """Return the Fresnel moments used by the top Robin boundary."""
 
         return {
@@ -205,7 +205,6 @@ class LXeCylinderGreen:
             "diffuse_escape_fraction": self.top_escape_fraction,
             "extrapolation_length_mm": self.top_extrapolation_length_mm,
             "robin_coefficient": self.beta_top,
-            "boundary_model": self.config.top_boundary_model,
         }
 
     def _first_boundary_distance(

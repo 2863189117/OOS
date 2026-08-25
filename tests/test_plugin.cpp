@@ -5,7 +5,6 @@
 #include <cmath>
 #include <filesystem>
 #include <map>
-#include <numeric>
 #include <vector>
 
 #include <hdf5.h>
@@ -166,106 +165,6 @@ void write_complex_adjoint_block(const std::filesystem::path& path) {
           {generator.size()});
   H5Fclose(file);
 }
-
-void write_joint_angular_block(const std::filesystem::path& path) {
-  const auto file =
-      H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-  REQUIRE(file >= 0);
-  group(file, "/function");
-  group(file, "/metadata");
-  dataset(file, "/function/coefficients_real", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.10, 0.30, 0.02, -0.01},
-          {1, 1, 1, 2, 1, 2});
-  dataset(file, "/function/coefficients_imag", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.0, 0.0, -0.01, 0.015},
-          {1, 1, 1, 2, 1, 2});
-  dataset(file, "/function/expected_return", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.4}, {1, 1, 1});
-  dataset(file, "/function/surface_ring_area_mm2", H5T_NATIVE_DOUBLE,
-          std::vector<double>{1.0}, {1});
-  dataset(file, "/function/angular_weight", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.25, 0.75}, {2});
-  const std::string grid =
-      R"({"position_radial_bins":1,"position_phi_bins":3,"direction_mu_bins":1,"direction_phi_bins":1})";
-  const std::string generator =
-      R"({"schema":"oos.nonlocal.function.v1","state_count":3,"egress_count":8,"surface_phi_bins":4,"angular_count":2,"contraction_bound":0.4,"explicit_collision_order":7,"coefficient_layout":"joint_surface_angle_v1"})";
-  dataset(file, "/metadata/phase_grid_json", H5T_NATIVE_UINT8,
-          std::vector<std::uint8_t>(grid.begin(), grid.end()),
-          {grid.size()});
-  dataset(file, "/metadata/generator_json", H5T_NATIVE_UINT8,
-          std::vector<std::uint8_t>(generator.begin(), generator.end()),
-          {generator.size()});
-  H5Fclose(file);
-}
-
-void write_ragged_factorized_block(const std::filesystem::path& path) {
-  const auto file =
-      H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-  REQUIRE(file >= 0);
-  group(file, "/function");
-  group(file, "/metadata");
-  dataset(file, "/function/coefficients_real", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.15, 0.25, 0.04, -0.03},
-          {1, 1, 1, 2, 2});
-  dataset(file, "/function/coefficients_imag", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.0, 0.0, -0.02, 0.01},
-          {1, 1, 1, 2, 2});
-  dataset(file, "/function/expected_return", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.4}, {1, 1, 1});
-  dataset(file, "/function/surface_ring_area_mm2", H5T_NATIVE_DOUBLE,
-          std::vector<double>{1.0, 1.0}, {2});
-  dataset(file, "/function/surface_ring_offsets", H5T_NATIVE_UINT64,
-          std::vector<std::uint64_t>{0, 2, 5}, {3});
-  dataset(file, "/function/surface_phi_rad", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.0, std::acos(-1.0), 0.0,
-                              2.0 * std::acos(-1.0) / 3.0,
-                              4.0 * std::acos(-1.0) / 3.0},
-          {5});
-  dataset(file, "/function/surface_area_mm2", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.5, 0.5, 1.0 / 3.0, 1.0 / 3.0,
-                              1.0 / 3.0},
-          {5});
-  dataset(file, "/function/angular_weight", H5T_NATIVE_DOUBLE,
-          std::vector<double>{0.25, 0.75}, {2});
-  const std::string grid =
-      R"({"position_radial_bins":1,"position_phi_bins":3,"direction_mu_bins":1,"direction_phi_bins":1})";
-  const std::string generator =
-      R"({"schema":"oos.nonlocal.function.v2","surface_layout":"ragged_ring_v1","surface_point_count":5,"state_count":3,"egress_count":10,"angular_count":2,"contraction_bound":0.4,"explicit_collision_order":7})";
-  dataset(file, "/metadata/phase_grid_json", H5T_NATIVE_UINT8,
-          std::vector<std::uint8_t>(grid.begin(), grid.end()),
-          {grid.size()});
-  dataset(file, "/metadata/generator_json", H5T_NATIVE_UINT8,
-          std::vector<std::uint8_t>(generator.begin(), generator.end()),
-          {generator.size()});
-  H5Fclose(file);
-}
-
-void overwrite_ragged_surface_area(const std::filesystem::path& path,
-                                   const std::vector<double>& values) {
-  REQUIRE(values.size() == 5);
-  const auto file = H5Fopen(path.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
-  REQUIRE(file >= 0);
-  const auto data =
-      H5Dopen2(file, "/function/surface_area_mm2", H5P_DEFAULT);
-  REQUIRE(data >= 0);
-  REQUIRE(H5Dwrite(data, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
-                   values.data()) >= 0);
-  H5Dclose(data);
-  H5Fclose(file);
-}
-
-void overwrite_ragged_expected_return(const std::filesystem::path& path,
-                                      double value) {
-  const auto file = H5Fopen(path.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
-  REQUIRE(file >= 0);
-  const auto data =
-      H5Dopen2(file, "/function/expected_return", H5P_DEFAULT);
-  REQUIRE(data >= 0);
-  REQUIRE(H5Dwrite(data, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
-                   &value) >= 0);
-  H5Dclose(data);
-  H5Fclose(file);
-}
 }  // namespace
 
 #ifdef OOS_TEST_LXE_PLUGIN_PATH
@@ -417,88 +316,6 @@ TEST_CASE("LXe complex Fourier action and adjoint satisfy duality") {
   oos::validate_function_operator(function, 1.0e-12);
   std::filesystem::remove(path);
 }
-
-TEST_CASE("LXe joint surface-angle coefficients preserve direction and duality") {
-  const auto path = std::filesystem::temp_directory_path() /
-                    "oos-lxe-joint-angular.h5";
-  write_joint_angular_block(path);
-  const auto config =
-      nlohmann::json{{"geometry", "finite_cylinder"},
-                     {"explicit_collision_order", 7},
-                     {"factorized_block_hdf5", path.string()}}
-          .dump();
-  oos::FunctionOperator function(OOS_TEST_LXE_PLUGIN_PATH, config, 7.0);
-  oos::validate_function_operator(function, 1.0e-12);
-
-  const auto applied = function.apply_cpu(1, {1.0, 0.0, 0.0});
-  REQUIRE(applied.egress.size() == 8);
-  REQUIRE(std::all_of(applied.egress.begin(), applied.egress.end(),
-                      [](double value) { return value >= 0.0; }));
-  double angle_zero = 0.0;
-  double angle_one = 0.0;
-  for (std::size_t point = 0; point < 4; ++point) {
-    angle_zero += applied.egress[2 * point];
-    angle_one += applied.egress[2 * point + 1];
-  }
-  REQUIRE(angle_zero == Catch::Approx(0.10).margin(1.0e-12));
-  REQUIRE(angle_one == Catch::Approx(0.30).margin(1.0e-12));
-  REQUIRE(applied.losses[0] == Catch::Approx(0.60).margin(1.0e-12));
-  std::filesystem::remove(path);
-}
-
-TEST_CASE("LXe v2 ragged rings preserve duality and probability") {
-  const auto path = std::filesystem::temp_directory_path() /
-                    "oos-lxe-ragged-adjoint.h5";
-  write_ragged_factorized_block(path);
-  const auto config =
-      nlohmann::json{{"geometry", "finite_cylinder"},
-                     {"explicit_collision_order", 7},
-                     {"factorized_block_hdf5", path.string()}}
-          .dump();
-  oos::FunctionOperator function(OOS_TEST_LXE_PLUGIN_PATH, config, 7.0);
-  REQUIRE(function.descriptor().input_state_count == 3);
-  REQUIRE(function.descriptor().egress_count == 10);
-  oos::validate_function_operator(function, 1.0e-12);
-
-  const auto applied = function.apply_cpu(
-      3, {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
-  for (std::uint64_t row = 0; row < 3; ++row) {
-    const auto begin = applied.egress.begin() + row * 10;
-    const double returned = std::accumulate(begin, begin + 10, 0.0);
-    REQUIRE(returned == Catch::Approx(0.4).margin(1.0e-12));
-    REQUIRE(applied.losses[row] == Catch::Approx(0.6).margin(1.0e-12));
-  }
-  std::filesystem::remove(path);
-}
-
-TEST_CASE("LXe v2 rejects nonconservative ragged quadrature") {
-  const auto path = std::filesystem::temp_directory_path() /
-                    "oos-lxe-ragged-invalid.h5";
-  write_ragged_factorized_block(path);
-  const auto config =
-      nlohmann::json{{"geometry", "finite_cylinder"},
-                     {"explicit_collision_order", 7},
-                     {"factorized_block_hdf5", path.string()}}
-          .dump();
-  SECTION("ring area mismatch") {
-    overwrite_ragged_surface_area(
-        path, {0.6, 0.5, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0});
-    REQUIRE_THROWS(
-        oos::FunctionOperator(OOS_TEST_LXE_PLUGIN_PATH, config, 7.0));
-  }
-  SECTION("retained Fourier mode alias") {
-    overwrite_ragged_surface_area(
-        path, {0.6, 0.4, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0});
-    REQUIRE_THROWS(
-        oos::FunctionOperator(OOS_TEST_LXE_PLUGIN_PATH, config, 7.0));
-  }
-  SECTION("m0 return mismatch") {
-    overwrite_ragged_expected_return(path, 0.41);
-    REQUIRE_THROWS(
-        oos::FunctionOperator(OOS_TEST_LXE_PLUGIN_PATH, config, 7.0));
-  }
-  std::filesystem::remove(path);
-}
 #endif
 
 TEST_CASE("local custom surface is composed with generic states") {
@@ -635,17 +452,6 @@ TEST_CASE("nonlocal egress rays are mapped by the core geometry") {
       oos::OperatorBuilder::build(analytic_egress_scene);
   REQUIRE(analytic_egress.transition.rows == operators.transition.rows);
   REQUIRE(analytic_egress.channel_ids == operators.channel_ids);
-
-  // Surface-element identifiers are local to a nonlocal surface and must
-  // resolve uniquely.  The builder indexes this lookup once, but preserves
-  // the previous ambiguity error when a referenced identifier is duplicated.
-  oos::Scene ambiguous_egress_scene = analytic_egress_scene;
-  ambiguous_egress_scene.mesh.analytic_surface_elements.push_back(
-      interface_element);
-  REQUIRE_THROWS_WITH(
-      oos::OperatorBuilder::build(ambiguous_egress_scene),
-      Catch::Matchers::ContainsSubstring(
-          "nonlocal egress surface element is ambiguous"));
 
   oos::Scene functional_scene = scene;
   functional_scene.surfaces.at(1).plugin_config_json =
